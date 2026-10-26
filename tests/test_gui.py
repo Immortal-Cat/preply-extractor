@@ -41,7 +41,16 @@ from preply_extractor.gui_logic import (
     prepare_playwright_runtime,
     vocabulary_alias,
 )
-from preply_extractor.preply_api import CATEGORIES, PreplyError, _payload, fetch_vocabulary, parse_learner_profile
+from preply_extractor.deck_job import open_browser_session
+from preply_extractor.preply_api import (
+    CATEGORIES,
+    BrowserSession,
+    PreplyError,
+    _payload,
+    fetch_vocabulary,
+    parse_learner_profile,
+    preferred_browser_channel,
+)
 from preply_extractor.words import VocabWord
 
 
@@ -593,6 +602,89 @@ class StartupFlowTests(unittest.TestCase):
                     opened.assert_not_called()
                 finally:
                     window.close()
+
+
+class ChromeProfileTests(unittest.TestCase):
+    def test_installed_chrome_selects_the_chrome_channel(self) -> None:
+        with patch("preply_extractor.preply_api.Path.is_file", return_value=True):
+            self.assertEqual(preferred_browser_channel(), "chrome")
+
+    def test_missing_chrome_keeps_playwright_chromium(self) -> None:
+        with patch("preply_extractor.preply_api.Path.is_file", return_value=False):
+            self.assertIsNone(preferred_browser_channel())
+
+    def test_program_profile_is_not_the_system_chrome_directory(self) -> None:
+        from preply_extractor.gui import PROFILE_DIR
+
+        text = str(PROFILE_DIR).replace("\\", "/").lower()
+        self.assertEqual(text, ".preply-profile")
+        self.assertNotIn("user data", text)
+        self.assertNotIn("google", text)
+        ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(".preply-profile/", ignore)
+
+    def test_launch_is_a_persistent_chrome_context_on_the_program_profile(self) -> None:
+        calls: dict[str, object] = {}
+
+        class Page:
+            def goto(self, *_args, **_kwargs):
+                return None
+
+        class Context:
+            pages = [Page()]
+
+            def close(self):
+                return None
+
+        class Chromium:
+            def launch_persistent_context(self, user_data_dir, **kwargs):
+                calls["dir"] = user_data_dir
+                calls["kwargs"] = kwargs
+                return Context()
+
+            def launch(self, **_kwargs):
+                raise AssertionError("a fresh browser context must not be used")
+
+        class Playwright:
+            chromium = Chromium()
+
+            def stop(self):
+                return None
+
+        class Started:
+            def start(self):
+                return Playwright()
+
+        profile = str(ROOT / ".preply-profile")
+        with (
+            patch("playwright.sync_api.sync_playwright", return_value=Started()),
+            patch.object(BrowserSession, "_wait_until_logged_in", lambda _self: None),
+        ):
+            session = BrowserSession(profile, "en", "", False, 1, channel="chrome")
+            session.__enter__()
+            session.__exit__(None, None, None)
+        self.assertEqual(calls["dir"], profile)
+        kwargs = calls["kwargs"]
+        assert isinstance(kwargs, dict)
+        self.assertEqual(kwargs.get("channel"), "chrome")
+        self.assertNotIn("User Data", str(calls["dir"]))
+
+    def test_open_browser_session_passes_chrome_and_the_given_directory(self) -> None:
+        seen: dict[str, object] = {}
+
+        def fake_enter(self):
+            seen["channel"] = self.channel
+            seen["dir"] = self.user_data_dir
+            return self
+
+        with (
+            patch("preply_extractor.deck_job.preferred_browser_channel", return_value="chrome"),
+            patch.object(BrowserSession, "__enter__", fake_enter),
+        ):
+            open_browser_session(ROOT / ".preply-profile", "en", "")
+        self.assertEqual(seen["channel"], "chrome")
+        self.assertTrue(str(seen["dir"]).endswith(".preply-profile"))
+        self.assertNotIn("User Data", str(seen["dir"]))
 
 
 if __name__ == "__main__":

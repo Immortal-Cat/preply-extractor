@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from preply_extractor.audio import AudioFailure, download_audio, read_local_audio
-from preply_extractor.preply_api import BrowserSession, public_get_bytes
+from preply_extractor.preply_api import BrowserSession, preferred_browser_channel, public_get_bytes
 from preply_extractor.words import VocabWord
 
 ProgressFn = Callable[[int, int, str], None]
@@ -47,7 +47,14 @@ def open_browser_session(
     headless: bool = False,
     login_timeout: float = 600,
     should_stop: Callable[[], bool] | None = None,
+    browser_channel: str | None = None,
 ) -> LiveSession:
+    """Open a persistent window. ``browser_channel=None`` picks Chrome when it is installed.
+
+    The directory is the one the caller passes (the program profile). This never
+    attaches Chrome's own user-data directory.
+    """
+    channel = preferred_browser_channel() if browser_channel is None else (browser_channel or None)
     browser = BrowserSession(
         str(user_data_dir),
         language_code,
@@ -55,6 +62,7 @@ def open_browser_session(
         headless,
         login_timeout,
         should_stop,
+        channel=channel,
     )
     browser.__enter__()
     return LiveSession(browser)

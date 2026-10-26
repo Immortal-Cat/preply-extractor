@@ -145,8 +145,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "downloading_audio": {"ru": "Скачивание произношения…", "en": "Downloading pronunciation…"},
     "writing_deck": {"ru": "Запись файла колоды…", "en": "Writing the deck file…"},
     "login_hint": {
-        "ru": "Компоненты уже проверены. Нажмите кнопку, чтобы открыть браузер и войти в свой аккаунт Preply. Пароль программа не спрашивает и не сохраняет. Пока кнопку не нажать, окно браузера не появится.",
-        "en": "The components are already checked. Click the button to open the browser and sign in to your Preply account. The program does not ask for your password or store it. The browser window stays closed until you click.",
+        "ru": "Компоненты уже проверены. Нажмите кнопку, чтобы открыть браузер и войти в свой аккаунт Preply. Пароль программа не спрашивает и не сохраняет. Пока кнопку не нажать, окно браузера не появится. Вход запоминается в отдельном профиле программы (.preply-profile), а не в обычном Chrome. Аккаунт Google, уже открытый в Chrome на этом компьютере, здесь не виден. Первый вход через Google в этом окне сохранится для следующих запусков.",
+        "en": "The components are already checked. Click the button to open the browser and sign in to your Preply account. The program does not ask for your password or store it. The browser window stays closed until you click. Sign-in is stored in the program's own profile (.preply-profile), not in regular Chrome. A Google account already signed in on this computer's Chrome is not visible here. The first Google sign-in in this window is remembered for later runs.",
     },
     "retry": {"ru": "Повторить", "en": "Retry"},
     "choose_language_title": {"ru": "Выберите язык", "en": "Choose a language"},

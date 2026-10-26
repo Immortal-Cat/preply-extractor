@@ -7,11 +7,13 @@ The user logs in themselves. The tool never asks for or stores a password.
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from preply_extractor.words import VocabWord, word_from_node
@@ -498,8 +500,42 @@ class RequestsSession:
         return session
 
 
+def installed_chrome_path() -> Path | None:
+    """Path to system Google Chrome, or None when it is not installed.
+
+    This does not look at Chrome's user-data directory and does not read cookies.
+    """
+    program = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    program_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    local = os.environ.get("LOCALAPPDATA", "")
+    candidates = [
+        Path(program) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(program_x86) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    ]
+    if local:
+        candidates.append(Path(local) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def preferred_browser_channel() -> str | None:
+    """``chrome`` when Google Chrome is installed, otherwise Playwright's own Chromium."""
+    if installed_chrome_path() is not None:
+        return "chrome"
+    return None
+
+
 class BrowserSession:
-    """Persistent Chromium profile. The user logs in once in the opened window."""
+    """Persistent browser profile. The user logs in once in the opened window.
+
+    The profile directory is dedicated to this program. It does not read the
+    Google cookies from the Chrome profile already used on this computer.
+    When Google Chrome is installed, the window is that Chrome (``channel="chrome"``)
+    so Google's sign-in page can offer a normal account chooser. The first
+    sign-in in this window is what later runs remember.
+    """
 
     def __init__(
         self,
@@ -509,6 +545,7 @@ class BrowserSession:
         headless: bool,
         login_timeout: float,
         should_stop: Callable[[], bool] | None = None,
+        channel: str | None = None,
     ) -> None:
         self.user_data_dir = user_data_dir
         self.language_code = language_code
@@ -516,6 +553,7 @@ class BrowserSession:
         self.headless = headless
         self.login_timeout = login_timeout
         self.should_stop = should_stop
+        self.channel = channel or None
         self._playwright = None
         self._context = None
         self._page = None
@@ -529,12 +567,17 @@ class BrowserSession:
                 "Playwright is not installed. Run: pip install -r requirements.txt && playwright install chromium"
             ) from exc
         self._playwright = sync_playwright().start()
+        launch_kwargs = {
+            "headless": self.headless,
+            "viewport": {"width": 1280, "height": 900},
+            "locale": self.language_code,
+        }
+        if self.channel:
+            launch_kwargs["channel"] = self.channel
         try:
             self._context = self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
-                headless=self.headless,
-                viewport={"width": 1280, "height": 900},
-                locale=self.language_code,
+                **launch_kwargs,
             )
         except Exception as exc:
             self._playwright.stop()
