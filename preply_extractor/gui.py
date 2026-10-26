@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -26,23 +27,29 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QStackedWidget,
-    QStyleFactory,
     QVBoxLayout,
     QWidget,
 )
 
 from preply_extractor.anki_package import build_apkg
-from preply_extractor.app_settings import existing_directory, load_settings, save_settings, settings_path
+from preply_extractor.app_settings import (
+    AppSettings,
+    existing_directory,
+    load_settings,
+    save_settings,
+    settings_path,
+)
 from preply_extractor.audio import AudioFailure
 from preply_extractor.cli import DEFAULT_DECK
 from preply_extractor.deck_job import collect_audio, open_browser_session
 from preply_extractor.gui_logic import (
     chromium_executable_exists,
-    ensure_playwright_chromium,
     is_missing_chromium_error,
     join_deck_path,
     language_label,
     language_plan,
+    playwright_importable,
+    prepare_playwright_runtime,
     vocabulary_alias,
     word_key,
 )
@@ -53,6 +60,7 @@ from preply_extractor.preply_api import (
     fetch_vocabulary,
 )
 from preply_extractor.settings_dialog import SettingsDialog
+from preply_extractor.themes import THEME_IDS, apply_theme, normalize_theme
 from preply_extractor.ui_text import (
     display_word,
     phrase_for_exception,
@@ -73,30 +81,6 @@ _STEP_LANGUAGE = 1
 _STEP_WORDS = 2
 _STEP_BUILD = 3
 _STEP_SAVE = 4
-
-_STYLE = """
-QMainWindow, QWidget { background: #f6f7f9; color: #1b1c1e; }
-QLabel#title { font-size: 20px; font-weight: 600; }
-QLabel#connection[state="connected"] { color: #0d652d; font-weight: 600; }
-QLabel#connection[state="logging_in"] { color: #8a4b08; font-weight: 600; }
-QLabel#connection[state="installing"] { color: #0b57d0; font-weight: 600; }
-QLabel#connection[state="failed"] { color: #b3261e; font-weight: 600; }
-QLabel#detail { color: #3c4048; }
-QLabel#step { color: #5f6368; padding: 4px 2px; }
-QLabel#step[active="true"] { color: #0b57d0; font-weight: 600; }
-QLabel#step[done="true"] { color: #0d652d; }
-QListWidget { background: white; border: 1px solid #d5d8de; border-radius: 8px; padding: 4px; }
-QListWidget::item { padding: 8px 6px; }
-QLineEdit { background: white; border: 1px solid #d5d8de; border-radius: 6px; padding: 6px 8px; min-height: 28px; }
-QPushButton { background: white; border: 1px solid #c5c9d1; border-radius: 6px; padding: 8px 16px; min-height: 32px; }
-QPushButton:hover { background: #eef3fd; }
-QPushButton:disabled { color: #8b909a; background: #eceef2; }
-QPushButton#primary { background: #0b57d0; color: white; border: none; }
-QPushButton#primary:hover { background: #0842a0; }
-QPushButton#primary:disabled { background: #c5d4f5; color: #f7f9fc; }
-QProgressBar { border: 1px solid #d5d8de; border-radius: 6px; background: white; text-align: center; min-height: 22px; }
-QProgressBar::chunk { background: #0b57d0; border-radius: 5px; }
-"""
 
 
 def russian_error(exc: BaseException) -> str:
@@ -283,7 +267,8 @@ class ExportWorker(QThread):
         )
 
     def _install_chromium_if_missing(self, force: bool = False) -> None:
-        installed = False if force else chromium_executable_exists()
+        package_installed = playwright_importable()
+        chromium_installed = False if force or not package_installed else chromium_executable_exists()
 
         def run(command: list[str]) -> tuple[int, str]:
             if self._stop:
@@ -300,7 +285,11 @@ class ExportWorker(QThread):
             output = "\n".join(part.strip() for part in (completed.stderr, completed.stdout) if part and part.strip())
             return completed.returncode, output
 
-        ensure_playwright_chromium(installed=installed, run=run)
+        prepare_playwright_runtime(
+            package_installed=package_installed,
+            chromium_installed=chromium_installed,
+            run=run,
+        )
 
     def _on_page(self, label: str, page: int, count: int) -> None:
         self._emit_status("connected", ("key", "category_page", {"label": label, "page": page, "count": count}))
@@ -806,7 +795,9 @@ class MainWindow(QMainWindow):
     def __init__(self, settings_file: Path | None = None) -> None:
         super().__init__()
         self._settings_path = settings_path() if settings_file is None else settings_file
-        set_language(load_settings(self._settings_path).ui_language)
+        stored = load_settings(self._settings_path)
+        set_language(stored.ui_language)
+        self._theme = normalize_theme(stored.theme)
         self._status_state = "logging_in"
         self._status_phrase: tuple = ("key", "checking_connection", {})
         self._has_profile = False
@@ -822,6 +813,7 @@ class MainWindow(QMainWindow):
         self._chooser_needed = False
 
         root = QWidget()
+        root.setObjectName("surface")
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -831,10 +823,19 @@ class MainWindow(QMainWindow):
         header.setContentsMargins(0, 0, 0, 0)
         self.heading = QLabel(tr("window_title"))
         self.heading.setObjectName("title")
+        self.theme_caption = QLabel(tr("theme"))
+        self.theme_caption.setObjectName("themeCaption")
+        self.theme_combo = QComboBox()
+        self.theme_combo.setObjectName("themeCombo")
+        self.theme_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._fill_theme_combo()
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_combo)
         self.settings_button = QPushButton(tr("settings"))
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.clicked.connect(self._open_settings)
         header.addWidget(self.heading, 1)
+        header.addWidget(self.theme_caption, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.theme_combo, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
 
@@ -896,6 +897,7 @@ class MainWindow(QMainWindow):
         self.words_panel.set_busy(True)
         self.login_panel.retry_button.setEnabled(False)
         self._apply_saved_folder()
+        self._apply_theme(self._theme, persist=False)
         self.worker.start()
         self.worker.connect_account()
 
@@ -1119,15 +1121,73 @@ class MainWindow(QMainWindow):
     def _apply_saved_folder(self) -> None:
         self.save_panel.apply_default_folder(load_settings(self._settings_path).default_save_dir)
 
-    def _open_settings(self) -> None:
-        dialog = SettingsDialog(self, load_settings(self._settings_path))
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+    def _fill_theme_combo(self) -> None:
+        self.theme_caption.setText(tr("theme"))
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.clear()
+        for theme_id in THEME_IDS:
+            self.theme_combo.addItem(tr(f"theme_{theme_id}"), theme_id)
+        index = self.theme_combo.findData(self._theme)
+        self.theme_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.theme_combo.blockSignals(False)
+
+    def _on_theme_combo(self, index: int) -> None:
+        theme_id = self.theme_combo.itemData(index)
+        if theme_id:
+            self._preview_theme(str(theme_id))
+
+    def _preview_theme(self, theme_id: str) -> None:
+        """Apply a theme immediately and store it. Settings Cancel rolls that store back."""
+        self._apply_theme(theme_id, persist=True)
+
+    def _apply_theme(self, theme_id: str, persist: bool) -> None:
+        self._theme = apply_theme(QApplication.instance(), theme_id)
+        if hasattr(self, "theme_combo"):
+            self._sync_theme_combo()
+        if persist:
+            self._persist_theme(self._theme)
+
+    def _sync_theme_combo(self) -> None:
+        index = self.theme_combo.findData(self._theme)
+        if index < 0:
+            index = 0
+        if self.theme_combo.currentIndex() == index:
             return
-        self._commit_settings(dialog.chosen())
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.setCurrentIndex(index)
+        self.theme_combo.blockSignals(False)
+
+    def _persist_theme(self, theme_id: str) -> None:
+        current = load_settings(self._settings_path)
+        if current.theme == theme_id:
+            return
+        save_settings(
+            AppSettings(current.ui_language, current.default_save_dir, theme_id),
+            self._settings_path,
+        )
+
+    def _open_settings(self) -> None:
+        dialog = self._make_settings_dialog(load_settings(self._settings_path))
+        dialog.exec()
+
+    def _make_settings_dialog(self, current: AppSettings) -> SettingsDialog:
+        initial_theme = normalize_theme(current.theme)
+        dialog = SettingsDialog(self, current, on_theme_preview=self._preview_theme)
+
+        def on_finished(result: int) -> None:
+            if result == QDialog.DialogCode.Accepted:
+                self._commit_settings(dialog.chosen())
+            else:
+                self._apply_theme(initial_theme, persist=True)
+
+        dialog.finished.connect(on_finished)
+        return dialog
 
     def _commit_settings(self, settings) -> None:
         save_settings(settings, self._settings_path)
         set_language(settings.ui_language)
+        self._theme = normalize_theme(settings.theme)
+        apply_theme(QApplication.instance(), self._theme)
         self.retranslate()
         self._apply_saved_folder()
 
@@ -1136,6 +1196,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(tr("window_title"))
         self.heading.setText(tr("window_title"))
         self.settings_button.setText(tr("settings"))
+        self._fill_theme_combo()
         self._rebuild_steps()
         self.login_panel.retranslate()
         self.language_panel.retranslate()
@@ -1155,10 +1216,8 @@ class MainWindow(QMainWindow):
 
 def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication(argv or sys.argv)
-    if "windowsvista" in QStyleFactory.keys():
-        app.setStyle("windowsvista")
     app.setFont(QFont("Segoe UI", 11))
-    app.setStyleSheet(_STYLE)
+    apply_theme(app, load_settings().theme)
     window = MainWindow()
     window.show()
     return app.exec()

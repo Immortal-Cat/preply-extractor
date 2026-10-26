@@ -1,4 +1,4 @@
-"""Interface language and default deck folder, stored outside the project tree."""
+"""Interface language, default deck folder, and theme, stored outside the project tree."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from preply_extractor.themes import DEFAULT_THEME, normalize_theme
+
 _LANGUAGES = {"ru", "en"}
 
 
@@ -14,6 +16,7 @@ _LANGUAGES = {"ru", "en"}
 class AppSettings:
     ui_language: str = "ru"
     default_save_dir: str = ""
+    theme: str = DEFAULT_THEME
 
 
 def settings_path() -> Path:
@@ -32,6 +35,7 @@ def load_settings(path: Path | None = None) -> AppSettings:
 
     An unknown ``ui_language`` falls back to Russian and no default folder.
     A missing language key stays Russian and still keeps a string folder.
+    A missing or unknown ``theme`` becomes navy and keeps the language and folder.
     """
     file = settings_path() if path is None else path
     try:
@@ -54,7 +58,7 @@ def load_settings(path: Path | None = None) -> AppSettings:
     folder = raw.get("default_save_dir", "")
     if not isinstance(folder, str):
         folder = ""
-    return AppSettings(ui_language=language, default_save_dir=folder)
+    return AppSettings(ui_language=language, default_save_dir=folder, theme=normalize_theme(raw.get("theme")))
 
 
 def save_settings(settings: AppSettings, path: Path | None = None) -> None:
@@ -63,7 +67,11 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
     if language not in _LANGUAGES:
         language = "ru"
     folder = settings.default_save_dir if isinstance(settings.default_save_dir, str) else ""
-    payload = {"ui_language": language, "default_save_dir": folder}
+    payload = {
+        "ui_language": language,
+        "default_save_dir": folder,
+        "theme": normalize_theme(settings.theme),
+    }
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

@@ -58,7 +58,14 @@ class SettingsFileTests(unittest.TestCase):
             save_settings(saved, path)
             self.assertEqual(load_settings(path), saved)
             body = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(body, {"ui_language": "en", "default_save_dir": r"D:\Колоды\Anki"})
+            self.assertEqual(
+                body,
+                {
+                    "ui_language": "en",
+                    "default_save_dir": r"D:\Колоды\Anki",
+                    "theme": "navy",
+                },
+            )
 
     def test_missing_file_is_russian_and_empty_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

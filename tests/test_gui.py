@@ -31,8 +31,10 @@ from preply_extractor.gui_logic import (
     ensure_playwright_chromium,
     format_profile,
     install_chromium_command,
+    install_playwright_package_command,
     join_deck_path,
     missing_browser_message,
+    prepare_playwright_runtime,
     vocabulary_alias,
 )
 from preply_extractor.preply_api import CATEGORIES, PreplyError, _payload, fetch_vocabulary, parse_learner_profile
@@ -100,6 +102,43 @@ class ChromiumInstallTests(unittest.TestCase):
             command = install_chromium_command(str(pythonw))
         self.assertEqual(command, [str(python), "-m", "playwright", "install", "chromium"])
         self.assertFalse(Path(command[0]).name.lower().startswith("pythonw"))
+
+    def test_missing_package_installs_pip_then_chromium_with_python_exe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            pythonw = folder / "pythonw.exe"
+            python = folder / "python.exe"
+            pythonw.write_text("w", encoding="utf-8")
+            python.write_text("p", encoding="utf-8")
+            seen: list[list[str]] = []
+
+            def run(command):
+                seen.append(list(command))
+                return 0, ""
+
+            with patch("preply_extractor.gui_logic.sys.executable", str(pythonw)):
+                started = prepare_playwright_runtime(
+                    package_installed=False,
+                    chromium_installed=False,
+                    run=run,
+                )
+            self.assertEqual(started, seen)
+            self.assertEqual(seen[0], install_playwright_package_command(str(pythonw)))
+            self.assertEqual(seen[1], install_chromium_command(str(pythonw)))
+            self.assertEqual(seen[0][0], str(python))
+            self.assertEqual(seen[1][0], str(python))
+            self.assertNotIn("pythonw", Path(seen[0][0]).name.lower())
+
+    def test_module_error_stays_visible(self) -> None:
+        detail = (
+            r"C:\Users\celis\AppData\Local\Programs\Python\Python313\python.exe: "
+            "No module named playwright"
+        )
+        text = missing_browser_message(detail)
+        self.assertIn("No module named playwright", text)
+        self.assertIn(r"Python313\python.exe", text)
+        self.assertNotIn("консол", text.lower())
+        self.assertNotIn("выполните", text.lower())
 
     def test_nonzero_exit_is_failure(self) -> None:
         def run(_command):
@@ -380,6 +419,7 @@ class BrowserRetryTests(unittest.TestCase):
         ready: list[object] = []
         worker.profile_ready.connect(ready.append)
         with (
+            patch("preply_extractor.gui.playwright_importable", return_value=True),
             patch("preply_extractor.gui.chromium_executable_exists", side_effect=exists),
             patch("preply_extractor.gui.subprocess.run", side_effect=run_install) as run,
             patch("preply_extractor.gui.open_browser_session", side_effect=open_session),
@@ -414,6 +454,7 @@ class BrowserRetryTests(unittest.TestCase):
             return object()
 
         with (
+            patch("preply_extractor.gui.playwright_importable", return_value=True),
             patch("preply_extractor.gui.chromium_executable_exists", return_value=True),
             patch("preply_extractor.gui.subprocess.run") as run,
             patch("preply_extractor.gui.open_browser_session", side_effect=open_session),
@@ -440,6 +481,7 @@ class BrowserRetryTests(unittest.TestCase):
             return completed
 
         with (
+            patch("preply_extractor.gui.playwright_importable", return_value=True),
             patch("preply_extractor.gui.chromium_executable_exists", return_value=False),
             patch("preply_extractor.gui.subprocess.run", side_effect=run_install),
             patch("preply_extractor.gui.open_browser_session") as opened,
@@ -474,6 +516,7 @@ class BrowserRetryTests(unittest.TestCase):
             worker.connect_failed.connect(failed.append)
             with (
                 patch("preply_extractor.gui_logic.sys.executable", str(pythonw)),
+                patch("preply_extractor.gui.playwright_importable", return_value=True),
                 patch("preply_extractor.gui.chromium_executable_exists", return_value=False),
                 patch("preply_extractor.gui.subprocess.run", side_effect=run_install) as run,
                 patch("preply_extractor.gui.open_browser_session") as opened,

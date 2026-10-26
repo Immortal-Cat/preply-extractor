@@ -85,6 +85,22 @@ def install_chromium_command(executable: str | None = None) -> list[str]:
     return [console_python(executable), "-m", "playwright", "install", "chromium"]
 
 
+PLAYWRIGHT_PIP_SPEC = "playwright==1.49.1"
+
+
+def playwright_importable() -> bool:
+    """True when this interpreter can import the Playwright package. Does not download it."""
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def install_playwright_package_command(executable: str | None = None) -> list[str]:
+    return [console_python(executable), "-m", "pip", "install", PLAYWRIGHT_PIP_SPEC]
+
+
 def chromium_executable_exists() -> bool:
     """True when Playwright's Chromium file is already on disk. Does not download it."""
     try:
@@ -167,10 +183,18 @@ def _install_failure_detail(detail: str) -> str:
         if not line:
             continue
         lowered = line.lower()
-        if any(hint in lowered for hint in _COMMAND_HINTS):
+        essential = (
+            "no module named" in lowered
+            or "modulenotfounderror" in lowered
+            or ".exe:" in lowered
+        )
+        if not essential and any(hint in lowered for hint in _COMMAND_HINTS):
             continue
         kept.append(line)
-    return " ".join(kept)
+    text = "\n".join(kept)
+    if len(text) > 1500:
+        return text[:1500].rstrip() + "…"
+    return text
 
 
 def vocabulary_alias(aliases: list[str], confirmed: str | None = None) -> str | None:
@@ -196,3 +220,26 @@ def ensure_playwright_chromium(*, installed: bool, run=run_chromium_install) -> 
     if code != 0:
         raise BrowserInstallError(code, output)
     return True
+
+
+def prepare_playwright_runtime(*, package_installed: bool, chromium_installed: bool, run) -> list[list[str]]:
+    """Install the Playwright package if import fails, then Chromium if the browser is missing.
+
+    ``run`` receives each command and returns ``(exit_code, output)``.
+    A non-zero exit raises ``BrowserInstallError`` with that output.
+    Returns the commands that were started.
+    """
+    started: list[list[str]] = []
+    if not package_installed:
+        command = install_playwright_package_command()
+        started.append(command)
+        code, output = run(command)
+        if code != 0:
+            raise BrowserInstallError(code, output)
+    if not chromium_installed:
+        command = install_chromium_command()
+        started.append(command)
+        code, output = run(command)
+        if code != 0:
+            raise BrowserInstallError(code, output)
+    return started
