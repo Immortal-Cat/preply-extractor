@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -88,6 +89,17 @@ class ChromiumInstallTests(unittest.TestCase):
         started = ensure_playwright_chromium(installed=False, run=run)
         self.assertTrue(started)
         self.assertEqual(seen, [[sys.executable, "-m", "playwright", "install", "chromium"]])
+
+    def test_pythonw_install_uses_console_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            pythonw = folder / "pythonw.exe"
+            python = folder / "python.exe"
+            pythonw.write_text("w", encoding="utf-8")
+            python.write_text("p", encoding="utf-8")
+            command = install_chromium_command(str(pythonw))
+        self.assertEqual(command, [str(python), "-m", "playwright", "install", "chromium"])
+        self.assertFalse(Path(command[0]).name.lower().startswith("pythonw"))
 
     def test_nonzero_exit_is_failure(self) -> None:
         def run(_command):
@@ -440,6 +452,43 @@ class BrowserRetryTests(unittest.TestCase):
         opened.assert_not_called()
         worker.retry_connection()
         self.assertEqual(worker._commands.get_nowait()[0], "retry")
+
+    def test_retry_under_pythonw_uses_python_exe_and_shows_stderr(self) -> None:
+        _app()
+        worker = ExportWorker()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            pythonw = folder / "pythonw.exe"
+            python = folder / "python.exe"
+            pythonw.write_text("w", encoding="utf-8")
+            python.write_text("p", encoding="utf-8")
+
+            def run_install(*_args, **_kwargs):
+                completed = type("Completed", (), {})()
+                completed.returncode = 1
+                completed.stderr = "download failed: disk full"
+                completed.stdout = "playwright install chromium"
+                return completed
+
+            failed: list[str] = []
+            worker.connect_failed.connect(failed.append)
+            with (
+                patch("preply_extractor.gui_logic.sys.executable", str(pythonw)),
+                patch("preply_extractor.gui.chromium_executable_exists", return_value=False),
+                patch("preply_extractor.gui.subprocess.run", side_effect=run_install) as run,
+                patch("preply_extractor.gui.open_browser_session") as opened,
+                patch("preply_extractor.gui.fetch_vocabulary") as vocab,
+            ):
+                worker._close_session()
+                worker._connect()
+            self.assertEqual(run.call_args.args[0][0], str(python))
+            self.assertFalse(Path(run.call_args.args[0][0]).name.lower().startswith("pythonw"))
+            self.assertEqual(len(failed), 1)
+            self.assertIn("disk full", failed[0])
+            self.assertNotIn("playwright install", failed[0].lower())
+            self.assertNotIn("консол", failed[0].lower())
+            opened.assert_not_called()
+            vocab.assert_not_called()
 
 
 if __name__ == "__main__":

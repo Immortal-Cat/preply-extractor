@@ -179,14 +179,27 @@ class ExportWorker(QThread):
             if command == "quit" or self._stop:
                 self._close_session()
                 return
-            if command in {"connect", "retry"}:
-                if command == "retry":
-                    self._close_session()
-                self._connect()
-            elif command == "load":
-                self._load(str(payload))
-            elif command == "build":
-                self._build(list(payload))
+            try:
+                if command in {"connect", "retry"}:
+                    if command == "retry":
+                        self._close_session()
+                    self._connect()
+                elif command == "load":
+                    self._load(str(payload))
+                elif command == "build":
+                    self._build(list(payload))
+            except Exception as exc:
+                self._close_session()
+                self._report_worker_error(exc)
+
+    def _report_worker_error(self, exc: BaseException) -> None:
+        """Keep installer and login failures in the window. pythonw hides stderr."""
+        if self._stop:
+            return
+        try:
+            self._emit_failure(self.connect_failed, self._connect_failed_queue, phrase_for_exception(exc))
+        except Exception:
+            self.connect_failed.emit(str(exc).strip() or "error")
 
     def _connect(self) -> None:
         if self._stop:
@@ -276,8 +289,15 @@ class ExportWorker(QThread):
             if self._stop:
                 raise SessionCancelled("closed")
             self._emit_status("installing", ("key", "installing_browser_detail", {}))
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
-            output = (completed.stderr or completed.stdout or "").strip()
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=flags,
+            )
+            output = "\n".join(part.strip() for part in (completed.stderr, completed.stdout) if part and part.strip())
             return completed.returncode, output
 
         ensure_playwright_chromium(installed=installed, run=run)
@@ -940,13 +960,23 @@ class MainWindow(QMainWindow):
         style.unpolish(widget)
         style.polish(widget)
 
+    def _ensure_worker(self) -> None:
+        if self.worker.isRunning() or self.worker.stopping():
+            return
+        self.worker.wait(500)
+        if not self.worker.isRunning() and not self.worker.stopping():
+            self.worker.start()
+
     def _retry_connect(self) -> None:
         self.login_panel.retry_button.setEnabled(False)
-        self._show_step(_STEP_LOGIN)
-        self._apply_phrase("logging_in", ("key", "checking_connection", {}))
-        self.worker.retry_connection()
-        if not self.worker.isRunning():
-            self.worker.start()
+        try:
+            self._show_step(_STEP_LOGIN)
+            self._apply_phrase("logging_in", ("key", "checking_connection", {}))
+            self._ensure_worker()
+            self.worker.retry_connection()
+        except Exception as exc:
+            self.login_panel.retry_button.setEnabled(True)
+            self._apply_phrase("failed", phrase_for_exception(exc))
 
     def _refresh(self) -> None:
         subject = self._selected_alias

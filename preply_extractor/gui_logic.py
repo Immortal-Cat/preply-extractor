@@ -64,8 +64,25 @@ def is_missing_chromium_error(message: str) -> bool:
     )
 
 
+def console_python(executable: str | None = None) -> str:
+    """Console interpreter for the Playwright installer.
+
+    The desktop shortcut starts the window with pythonw.exe. That program has
+    no console, and ``pythonw -m playwright install chromium`` can exit without
+    output or never return. The installer has to use python.exe beside it.
+    """
+    path = Path(executable or sys.executable)
+    name = path.name.lower()
+    if name in {"pythonw.exe", "pythonw"}:
+        sibling_name = "python.exe" if name.endswith(".exe") else "python"
+        sibling = path.with_name(sibling_name)
+        if sibling.is_file():
+            return str(sibling)
+    return str(path)
+
+
 def install_chromium_command(executable: str | None = None) -> list[str]:
-    return [executable or sys.executable, "-m", "playwright", "install", "chromium"]
+    return [console_python(executable), "-m", "playwright", "install", "chromium"]
 
 
 def chromium_executable_exists() -> bool:
@@ -73,7 +90,7 @@ def chromium_executable_exists() -> bool:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return True
+        return False
     with sync_playwright() as playwright:
         return Path(playwright.chromium.executable_path).is_file()
 
