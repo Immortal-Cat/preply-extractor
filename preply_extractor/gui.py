@@ -517,6 +517,23 @@ class WordListPanel(QWidget):
         self.clear_button.setEnabled(total > 0 and not self._busy)
         self.next_button.setEnabled(selected > 0 and not self._busy)
 
+    def retranslate(self) -> None:
+        self.language_caption.setText(tr("language_word"))
+        self.switch_button.setText(tr("change_language"))
+        self.empty_label.setText(tr("no_saved_words"))
+        self.select_all_button.setText(tr("select_all"))
+        self.clear_button.setText(tr("clear_selection"))
+        self.refresh_button.setText(tr("refresh"))
+        self.next_button.setText(tr("next"))
+        self.word_list.blockSignals(True)
+        for index in range(self.word_list.count()):
+            item = self.word_list.item(index)
+            word = self._words.get(str(item.data(Qt.ItemDataRole.UserRole)))
+            if word is not None:
+                item.setText(display_word(word))
+        self.word_list.blockSignals(False)
+        self._update_confirm()
+
 
 class BuildPanel(QWidget):
     def __init__(self) -> None:
@@ -524,9 +541,11 @@ class BuildPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        self.title = QLabel("Сборка колоды")
+        self._detail_phrase: tuple = ("key", "build_preparing", {})
+        self._summary_phrase: tuple | None = None
+        self.title = QLabel(tr("build_title"))
         self.title.setObjectName("title")
-        self.detail = QLabel("Подготовка…")
+        self.detail = QLabel(phrase_text(self._detail_phrase))
         self.detail.setObjectName("detail")
         self.detail.setWordWrap(True)
         self.progress = QProgressBar()
@@ -534,7 +553,7 @@ class BuildPanel(QWidget):
         self.progress.setValue(0)
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
-        self.back_button = QPushButton("К списку слов")
+        self.back_button = QPushButton(tr("back_to_words"))
         button_row = QHBoxLayout()
         button_row.addStretch(1)
         button_row.addWidget(self.back_button)
@@ -547,21 +566,33 @@ class BuildPanel(QWidget):
         self.back_button.hide()
 
     def reset(self, total: int) -> None:
-        self.detail.setText("Скачивание произношения…")
+        self._detail_phrase = ("key", "downloading_audio", {})
+        self._summary_phrase = None
+        self.detail.setText(phrase_text(self._detail_phrase))
         self.summary.setText("")
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(0)
         self.back_button.hide()
 
-    def show_progress(self, done: int, total: int, text: str) -> None:
+    def show_progress(self, done: int, total: int, text: str, phrase: tuple | None = None) -> None:
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(min(done, total))
-        self.detail.setText(text)
+        self._detail_phrase = phrase if phrase is not None else ("plain", text)
+        self.detail.setText(phrase_text(self._detail_phrase))
 
-    def show_error(self, message: str) -> None:
-        self.detail.setText("Не удалось собрать колоду.")
-        self.summary.setText(message)
+    def show_error(self, message: str, phrase: tuple | None = None) -> None:
+        self._detail_phrase = ("key", "build_failed_short", {})
+        self.detail.setText(phrase_text(self._detail_phrase))
+        self._summary_phrase = phrase if phrase is not None else ("plain", message)
+        self.summary.setText(phrase_text(self._summary_phrase))
         self.back_button.show()
+
+    def retranslate(self) -> None:
+        self.title.setText(tr("build_title"))
+        self.back_button.setText(tr("back_to_words"))
+        self.detail.setText(phrase_text(self._detail_phrase))
+        if self._summary_phrase is not None:
+            self.summary.setText(phrase_text(self._summary_phrase))
 
 
 class SavePanel(QWidget):
@@ -571,29 +602,33 @@ class SavePanel(QWidget):
         self._temp_path: Path | None = None
         self._failures: list[AudioFailure] = []
         self._saved = False
+        self._reported_total: int | None = None
+        self._saved_path: Path | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        title = QLabel("Сохранение колоды")
-        title.setObjectName("title")
+        self.title = QLabel(tr("save_title"))
+        self.title.setObjectName("title")
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
-        layout.addWidget(title)
+        layout.addWidget(self.title)
         layout.addWidget(self.summary)
 
         folder_row = QHBoxLayout()
-        folder_row.addWidget(QLabel("Папка"))
+        self.folder_label = QLabel(tr("folder"))
+        folder_row.addWidget(self.folder_label)
         self.folder_edit = QLineEdit(str(self._folder))
         self.folder_edit.setReadOnly(True)
-        browse = QPushButton("Обзор…")
-        browse.clicked.connect(lambda _checked=False: self._browse())
+        self.browse_button = QPushButton(tr("browse"))
+        self.browse_button.clicked.connect(lambda _checked=False: self._browse())
         folder_row.addWidget(self.folder_edit, 1)
-        folder_row.addWidget(browse)
+        folder_row.addWidget(self.browse_button)
         layout.addLayout(folder_row)
 
         name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Имя файла"))
+        self.name_label = QLabel(tr("file_name"))
+        name_row.addWidget(self.name_label)
         self.name_edit = QLineEdit("Preply Vocabulary")
         self.name_edit.textChanged.connect(lambda _text: self._refresh_preview())
         name_row.addWidget(self.name_edit, 1)
@@ -611,8 +646,8 @@ class SavePanel(QWidget):
         layout.addWidget(self.success)
 
         buttons = QHBoxLayout()
-        self.back_button = QPushButton("К списку слов")
-        self.save_button = QPushButton("Сохранить")
+        self.back_button = QPushButton(tr("back_to_words"))
+        self.save_button = QPushButton(tr("save"))
         self.save_button.setObjectName("primary")
         self.save_button.clicked.connect(lambda _checked=False: self._save())
         buttons.addWidget(self.back_button)
