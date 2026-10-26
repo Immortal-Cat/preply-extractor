@@ -1,0 +1,35 @@
+{
+  "format": "preply-vocabulary-export",
+  "version": 1,
+  "note": "Offline fixture for the deck builder. These are not words from a Preply account.",
+  "words": [
+    {
+      "id": "fixture-speak",
+      "category": "ADDED_READY_TO_PRACTICE",
+      "lexeme": "speak",
+      "definition": "to say words, to use the voice, or to have a conversation with someone",
+      "examples": [
+        "Would you mind speaking more slowly, please?",
+        "\"Can I speak to Dan please?\""
+      ],
+      "audioFile": "speak.wav"
+    },
+    {
+      "id": "fixture-understand",
+      "category": "ADDED_UP_NEXT",
+      "lexeme": "understand",
+      "definition": "to know the meaning of something that someone says",
+      "examples": [
+        "She explained the whole idea again, but I still didn't understand."
+      ]
+    },
+    {
+      "id": "fixture-english",
+      "category": "ADDED_MASTERED",
+      "lexeme": "English",
+      "definition": "a language that is spoken in the UK, the US, and in many other countries",
+      "examples": [],
+      "audioFile": "speak.wav"
+    }
+  ]
+}

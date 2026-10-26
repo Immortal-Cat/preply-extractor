@@ -1,0 +1,74 @@
+{
+  "deck": {
+    "id": 205501121324,
+    "name": "Ultimate English Collection (EN definitions + audio)",
+    "desc": "",
+    "conf": 1
+  },
+  "model": {
+    "css": ".card { font-family: Segoe UI, Arial, sans-serif; font-size: 20px; text-align: center; color: #111; background: #fff; line-height: 1.45; }",
+    "did": 205501121324,
+    "flds": [
+      {
+        "name": "Front",
+        "ord": 0,
+        "font": "Liberation Sans",
+        "media": [],
+        "rtl": false,
+        "size": 20,
+        "sticky": false
+      },
+      {
+        "name": "Back",
+        "ord": 1,
+        "font": "Liberation Sans",
+        "media": [],
+        "rtl": false,
+        "size": 20,
+        "sticky": false
+      },
+      {
+        "name": "Audio",
+        "ord": 2,
+        "font": "Liberation Sans",
+        "media": [],
+        "rtl": false,
+        "size": 20,
+        "sticky": false
+      }
+    ],
+    "id": "205501121325",
+    "latexPost": "\\end{document}",
+    "latexPre": "\\documentclass[12pt]{article}\n\\special{papersize=3in,5in}\n\\usepackage[utf8]{inputenc}\n\\usepackage{amssymb,amsmath}\n\\pagestyle{empty}\n\\setlength{\\parindent}{0in}\n\\begin{document}\n",
+    "latexsvg": false,
+    "mod": 1791801750,
+    "name": "EN definition (type-in + audio)",
+    "req": [
+      [
+        0,
+        "all",
+        [
+          0
+        ]
+      ]
+    ],
+    "sortf": 0,
+    "tags": [],
+    "tmpls": [
+      {
+        "name": "Card 1",
+        "qfmt": "{{Front}}\n\n{{type:Back}}",
+        "afmt": "{{Front}}\n\n<hr id=answer>\n\n{{type:Back}}\n\n{{Audio}}",
+        "ord": 0,
+        "bafmt": "",
+        "bqfmt": "",
+        "bfont": "",
+        "bsize": 0,
+        "did": null
+      }
+    ],
+    "type": 0,
+    "usn": -1,
+    "vers": []
+  }
+}

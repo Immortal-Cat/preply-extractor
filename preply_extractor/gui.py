@@ -1,0 +1,998 @@
+"""Russian desktop wizard for the Preply vocabulary export."""
+
+from __future__ import annotations
+
+import json
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QStackedWidget,
+    QStyleFactory,
+    QVBoxLayout,
+    QWidget,
+)
+
+from preply_extractor.anki_package import build_apkg
+from preply_extractor.app_settings import existing_directory, load_settings, save_settings, settings_path
+from preply_extractor.audio import AudioFailure
+from preply_extractor.cli import DEFAULT_DECK
+from preply_extractor.deck_job import collect_audio, open_browser_session
+from preply_extractor.gui_logic import (
+    chromium_executable_exists,
+    ensure_playwright_chromium,
+    is_missing_chromium_error,
+    join_deck_path,
+    language_label,
+    language_plan,
+    vocabulary_alias,
+    word_key,
+)
+from preply_extractor.preply_api import (
+    LearnerProfile,
+    SessionCancelled,
+    fetch_learner_profile,
+    fetch_vocabulary,
+)
+from preply_extractor.settings_dialog import SettingsDialog
+from preply_extractor.ui_text import (
+    display_word,
+    phrase_for_exception,
+    phrase_text,
+    profile_text,
+    set_language,
+    state_title,
+    tr,
+)
+from preply_extractor.words import VocabWord
+
+PROFILE_DIR = Path(".preply-profile")
+PAGE_SIZE = 20
+PAGE_DELAY = 0.25
+UI_LANGUAGE = "en"
+_STEP_LOGIN = 0
+_STEP_LANGUAGE = 1
+_STEP_WORDS = 2
+_STEP_BUILD = 3
+_STEP_SAVE = 4
+
+_STYLE = """
+QMainWindow, QWidget { background: #f6f7f9; color: #1b1c1e; }
+QLabel#title { font-size: 20px; font-weight: 600; }
+QLabel#connection[state="connected"] { color: #0d652d; font-weight: 600; }
+QLabel#connection[state="logging_in"] { color: #8a4b08; font-weight: 600; }
+QLabel#connection[state="installing"] { color: #0b57d0; font-weight: 600; }
+QLabel#connection[state="failed"] { color: #b3261e; font-weight: 600; }
+QLabel#detail { color: #3c4048; }
+QLabel#step { color: #5f6368; padding: 4px 2px; }
+QLabel#step[active="true"] { color: #0b57d0; font-weight: 600; }
+QLabel#step[done="true"] { color: #0d652d; }
+QListWidget { background: white; border: 1px solid #d5d8de; border-radius: 8px; padding: 4px; }
+QListWidget::item { padding: 8px 6px; }
+QLineEdit { background: white; border: 1px solid #d5d8de; border-radius: 6px; padding: 6px 8px; min-height: 28px; }
+QPushButton { background: white; border: 1px solid #c5c9d1; border-radius: 6px; padding: 8px 16px; min-height: 32px; }
+QPushButton:hover { background: #eef3fd; }
+QPushButton:disabled { color: #8b909a; background: #eceef2; }
+QPushButton#primary { background: #0b57d0; color: white; border: none; }
+QPushButton#primary:hover { background: #0842a0; }
+QPushButton#primary:disabled { background: #c5d4f5; color: #f7f9fc; }
+QProgressBar { border: 1px solid #d5d8de; border-radius: 6px; background: white; text-align: center; min-height: 22px; }
+QProgressBar::chunk { background: #0b57d0; border-radius: 5px; }
+"""
+
+
+def russian_error(exc: BaseException) -> str:
+    """User-visible error in the active interface language. Russian is the default."""
+    return phrase_text(phrase_for_exception(exc))
+
+
+def _pop(bucket: queue.Queue):
+    try:
+        return bucket.get_nowait()
+    except queue.Empty:
+        return None
+
+
+def default_save_folder() -> Path:
+    documents = Path.home() / "Documents"
+    if documents.is_dir():
+        return documents
+    return Path.cwd()
+
+
+class ExportWorker(QThread):
+    """Owns the Playwright window and never touches Qt widgets."""
+
+    status_changed = Signal(str, str)
+    words_ready = Signal(object)
+    load_failed = Signal(str)
+    profile_ready = Signal(object)
+    connect_failed = Signal(str)
+    build_progress = Signal(int, int, str)
+    build_ready = Signal(str, object)
+    build_failed = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._commands: queue.Queue = queue.Queue()
+        self._status_queue: queue.Queue = queue.Queue()
+        self._load_failed_queue: queue.Queue = queue.Queue()
+        self._connect_failed_queue: queue.Queue = queue.Queue()
+        self._build_failed_queue: queue.Queue = queue.Queue()
+        self._progress_queue: queue.Queue = queue.Queue()
+        self._session = None
+        self._stop = False
+
+    def stopping(self) -> bool:
+        return self._stop
+
+    def _emit_status(self, state: str, phrase: tuple) -> None:
+        self._status_queue.put((state, phrase))
+        self.status_changed.emit(state, phrase_text(phrase))
+
+    def _emit_failure(self, signal: Signal, bucket: queue.Queue, phrase: tuple) -> None:
+        bucket.put(phrase)
+        signal.emit(phrase_text(phrase))
+
+    def _emit_progress(self, done: int, total: int, phrase: tuple) -> None:
+        self._progress_queue.put(phrase)
+        self.build_progress.emit(done, total, phrase_text(phrase))
+
+    def connect_account(self) -> None:
+        self._commands.put(("connect", None))
+
+    def retry_connection(self) -> None:
+        """Close any half-open session, install Chromium if it is missing, then log in again."""
+        self._commands.put(("retry", None))
+
+    def load(self, subject: str) -> None:
+        self._commands.put(("load", subject.strip().lower()))
+
+    def build(self, words: list[VocabWord]) -> None:
+        self._commands.put(("build", list(words)))
+
+    def request_stop(self) -> None:
+        self._stop = True
+        self._commands.put(("quit", None))
+
+    def run(self) -> None:
+        while True:
+            command, payload = self._commands.get()
+            if command == "quit" or self._stop:
+                self._close_session()
+                return
+            if command in {"connect", "retry"}:
+                if command == "retry":
+                    self._close_session()
+                self._connect()
+            elif command == "load":
+                self._load(str(payload))
+            elif command == "build":
+                self._build(list(payload))
+
+    def _connect(self) -> None:
+        if self._stop:
+            return
+        try:
+            self._ensure_session()
+            if self._stop or self._session is None:
+                return
+            self._emit_status("connected", ("key", "reading_profile", {}))
+            profile = fetch_learner_profile(self._session.post_json, endpoint=self._session.endpoint)
+            if self._stop:
+                return
+            self.profile_ready.emit(profile)
+        except SessionCancelled:
+            return
+        except Exception as exc:
+            self._close_session()
+            if not self._stop:
+                self._emit_failure(self.connect_failed, self._connect_failed_queue, phrase_for_exception(exc))
+
+    def _load(self, subject: str) -> None:
+        if self._stop:
+            return
+        if not subject:
+            self._emit_failure(self.load_failed, self._load_failed_queue, ("key", "subject_missing", {}))
+            return
+        try:
+            self._ensure_session()
+            if self._stop or self._session is None:
+                return
+            self._emit_status("connected", ("key", "loading_vocab", {}))
+            words = fetch_vocabulary(
+                self._session.post_json,
+                subject=subject,
+                language_code=UI_LANGUAGE,
+                page_size=PAGE_SIZE,
+                delay_seconds=PAGE_DELAY,
+                on_page=self._on_page,
+            )
+            if self._stop:
+                return
+            if words:
+                phrase = ("key", "words_loaded", {"count": len(words)})
+            else:
+                phrase = ("key", "no_saved_words", {})
+            self._emit_status("connected", phrase)
+            self.words_ready.emit(words)
+        except SessionCancelled:
+            return
+        except Exception as exc:
+            self._close_session()
+            if not self._stop:
+                self._emit_failure(self.load_failed, self._load_failed_queue, phrase_for_exception(exc))
+
+    def _ensure_session(self) -> None:
+        if self._session is not None:
+            return
+        self._install_chromium_if_missing()
+        if self._stop:
+            return
+        self._emit_status("logging_in", ("key", "opening_browser", {}))
+        try:
+            self._session = self._open_session()
+        except Exception as exc:
+            if self._stop or not is_missing_chromium_error(str(exc)):
+                raise
+            self._install_chromium_if_missing(force=True)
+            if self._stop:
+                return
+            self._emit_status("logging_in", ("key", "opening_browser", {}))
+            self._session = self._open_session()
+
+    def _open_session(self):
+        return open_browser_session(
+            PROFILE_DIR.resolve(),
+            UI_LANGUAGE,
+            "",
+            headless=False,
+            login_timeout=600,
+            should_stop=self.stopping,
+        )
+
+    def _install_chromium_if_missing(self, force: bool = False) -> None:
+        installed = False if force else chromium_executable_exists()
+
+        def run(command: list[str]) -> tuple[int, str]:
+            if self._stop:
+                raise SessionCancelled("closed")
+            self._emit_status("installing", ("key", "installing_browser_detail", {}))
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            output = (completed.stderr or completed.stdout or "").strip()
+            return completed.returncode, output
+
+        ensure_playwright_chromium(installed=installed, run=run)
+
+    def _on_page(self, label: str, page: int, count: int) -> None:
+        self._emit_status("connected", ("key", "category_page", {"label": label, "page": page, "count": count}))
+
+    def _build(self, words: list[VocabWord]) -> None:
+        directory: Path | None = None
+        try:
+            if self._session is None:
+                raise RuntimeError("Нет подключения к Preply.")
+            total = len(words)
+
+            def on_progress(index: int, count: int, lexeme: str) -> None:
+                if self._stop:
+                    raise SessionCancelled("closed")
+                self._emit_progress(index, count, ("key", "audio_progress", {"index": index, "count": count, "lexeme": lexeme}))
+
+            self._emit_progress(0, total, ("key", "downloading_audio", {}))
+            audio, failures = collect_audio(words, self._session, 3, on_progress=on_progress)
+            if self._stop:
+                return
+            self._emit_progress(total, total, ("key", "writing_deck", {}))
+            directory = Path(tempfile.mkdtemp(prefix="preply-anki-"))
+            path = build_apkg(directory / "Preply Vocabulary.apkg", words, audio, DEFAULT_DECK)
+            self.build_ready.emit(str(path), failures)
+        except SessionCancelled:
+            if directory is not None:
+                shutil.rmtree(directory, ignore_errors=True)
+        except Exception as exc:
+            if directory is not None:
+                shutil.rmtree(directory, ignore_errors=True)
+            if not self._stop:
+                self._emit_failure(self.build_failed, self._build_failed_queue, phrase_for_exception(exc))
+
+    def _close_session(self) -> None:
+        session = self._session
+        self._session = None
+        if session is not None:
+            session.close()
+
+
+class LoginPanel(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        self.hint = QLabel(tr("login_hint"))
+        self.hint.setWordWrap(True)
+        self.retry_button = QPushButton(tr("retry"))
+        row = QHBoxLayout()
+        row.addWidget(self.retry_button)
+        row.addStretch(1)
+        layout.addWidget(self.hint)
+        layout.addLayout(row)
+        layout.addStretch(1)
+
+    def retranslate(self) -> None:
+        self.hint.setText(tr("login_hint"))
+        self.retry_button.setText(tr("retry"))
+
+
+class LanguagePanel(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._aliases: list[str] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.title = QLabel(tr("choose_language_title"))
+        self.title.setObjectName("title")
+        self.hint = QLabel(tr("choose_language_hint"))
+        self.hint.setWordWrap(True)
+        self.language_list = QListWidget()
+        self.language_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.language_list.currentItemChanged.connect(lambda _current, _previous: self._update_confirm())
+        self.confirm_button = QPushButton(tr("continue"))
+        self.confirm_button.setObjectName("primary")
+        self.confirm_button.setEnabled(False)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self.confirm_button)
+        layout.addWidget(self.title)
+        layout.addWidget(self.hint)
+        layout.addWidget(self.language_list, 1)
+        layout.addLayout(row)
+
+    def set_languages(self, languages: list[tuple[str, str]]) -> None:
+        self._aliases = []
+        self.language_list.clear()
+        for alias, label in languages:
+            cleaned = alias.strip().lower()
+            if not cleaned:
+                continue
+            self._aliases.append(cleaned)
+            item = QListWidgetItem(label or cleaned)
+            item.setData(Qt.ItemDataRole.UserRole, cleaned)
+            self.language_list.addItem(item)
+        self._update_confirm()
+
+    def selected_alias(self) -> str:
+        item = self.language_list.currentItem()
+        if item is None:
+            return ""
+        return str(item.data(Qt.ItemDataRole.UserRole) or "")
+
+    def _update_confirm(self) -> None:
+        self.confirm_button.setEnabled(bool(self.selected_alias()))
+
+    def retranslate(self) -> None:
+        self.title.setText(tr("choose_language_title"))
+        self.hint.setText(tr("choose_language_hint"))
+        self.confirm_button.setText(tr("continue"))
+
+
+class WordListPanel(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._words: dict[str, VocabWord] = {}
+        self._order: list[str] = []
+        self._busy = False
+        self._subject = ""
+        self._can_switch = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        subject_row = QHBoxLayout()
+        self.language_caption = QLabel(tr("language_word"))
+        subject_row.addWidget(self.language_caption)
+        self.language_label = QLabel("—")
+        self.switch_button = QPushButton(tr("change_language"))
+        self.switch_button.hide()
+        subject_row.addWidget(self.language_label)
+        subject_row.addStretch(1)
+        subject_row.addWidget(self.switch_button)
+        layout.addLayout(subject_row)
+
+        self.empty_label = QLabel(tr("no_saved_words"))
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.hide()
+        layout.addWidget(self.empty_label)
+
+        self.word_list = QListWidget()
+        self.word_list.setAlternatingRowColors(True)
+        self.word_list.itemChanged.connect(lambda _item: self._update_confirm())
+        layout.addWidget(self.word_list, 1)
+
+        self.count_label = QLabel(tr("selected_count", selected=0, total=0))
+        layout.addWidget(self.count_label)
+
+        buttons = QHBoxLayout()
+        self.select_all_button = QPushButton(tr("select_all"))
+        self.clear_button = QPushButton(tr("clear_selection"))
+        self.refresh_button = QPushButton(tr("refresh"))
+        self.next_button = QPushButton(tr("next"))
+        self.next_button.setObjectName("primary")
+        self.select_all_button.clicked.connect(self.select_all)
+        self.clear_button.clicked.connect(self.clear_selection)
+        buttons.addWidget(self.select_all_button)
+        buttons.addWidget(self.clear_button)
+        buttons.addWidget(self.refresh_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.next_button)
+        layout.addLayout(buttons)
+        self._update_confirm()
+
+    def selected_subject(self) -> str:
+        return self._subject
+
+    def set_language(self, label: str, alias: str, can_switch: bool) -> None:
+        self._subject = alias.strip().lower()
+        self._can_switch = can_switch
+        self.language_label.setText(label or self._subject or "—")
+        self.switch_button.setVisible(can_switch)
+        self._update_confirm()
+
+    def set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._update_confirm()
+
+    def set_words(self, words: list[VocabWord], keep_checks: bool = True) -> None:
+        previous = self.checked_keys() if keep_checks else set()
+        self._words = {word_key(word): word for word in words}
+        self._order = [word_key(word) for word in words]
+        self.word_list.blockSignals(True)
+        self.word_list.clear()
+        for word in words:
+            key = word_key(word)
+            item = QListWidgetItem(display_word(word))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setToolTip(word.definition or word.lexeme)
+            item.setCheckState(Qt.CheckState.Checked if key in previous else Qt.CheckState.Unchecked)
+            self.word_list.addItem(item)
+        self.word_list.blockSignals(False)
+        has_words = bool(words)
+        self.empty_label.setVisible(not has_words)
+        self.word_list.setVisible(has_words)
+        self._update_confirm()
+
+    def checked_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for index in range(self.word_list.count()):
+            item = self.word_list.item(index)
+            if item.checkState() == Qt.CheckState.Checked:
+                keys.add(str(item.data(Qt.ItemDataRole.UserRole)))
+        return keys
+
+    def selected_words(self) -> list[VocabWord]:
+        chosen = self.checked_keys()
+        return [self._words[key] for key in self._order if key in chosen]
+
+    def select_all(self, _checked: bool = False) -> None:
+        self._set_all(Qt.CheckState.Checked)
+
+    def clear_selection(self, _checked: bool = False) -> None:
+        self._set_all(Qt.CheckState.Unchecked)
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        self.word_list.blockSignals(True)
+        for index in range(self.word_list.count()):
+            self.word_list.item(index).setCheckState(state)
+        self.word_list.blockSignals(False)
+        self._update_confirm()
+
+    def _update_confirm(self) -> None:
+        selected = len(self.checked_keys())
+        total = self.word_list.count()
+        self.count_label.setText(tr("selected_count", selected=selected, total=total))
+        self.switch_button.setEnabled(self._can_switch and not self._busy)
+        self.refresh_button.setEnabled(not self._busy and bool(self._subject))
+        self.select_all_button.setEnabled(total > 0 and not self._busy)
+        self.clear_button.setEnabled(total > 0 and not self._busy)
+        self.next_button.setEnabled(selected > 0 and not self._busy)
+
+
+class BuildPanel(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        self.title = QLabel("Сборка колоды")
+        self.title.setObjectName("title")
+        self.detail = QLabel("Подготовка…")
+        self.detail.setObjectName("detail")
+        self.detail.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        self.back_button = QPushButton("К списку слов")
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.back_button)
+        layout.addWidget(self.title)
+        layout.addWidget(self.detail)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.summary)
+        layout.addStretch(1)
+        layout.addLayout(button_row)
+        self.back_button.hide()
+
+    def reset(self, total: int) -> None:
+        self.detail.setText("Скачивание произношения…")
+        self.summary.setText("")
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(0)
+        self.back_button.hide()
+
+    def show_progress(self, done: int, total: int, text: str) -> None:
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(min(done, total))
+        self.detail.setText(text)
+
+    def show_error(self, message: str) -> None:
+        self.detail.setText("Не удалось собрать колоду.")
+        self.summary.setText(message)
+        self.back_button.show()
+
+
+class SavePanel(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._folder = default_save_folder()
+        self._temp_path: Path | None = None
+        self._failures: list[AudioFailure] = []
+        self._saved = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        title = QLabel("Сохранение колоды")
+        title.setObjectName("title")
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(self.summary)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Папка"))
+        self.folder_edit = QLineEdit(str(self._folder))
+        self.folder_edit.setReadOnly(True)
+        browse = QPushButton("Обзор…")
+        browse.clicked.connect(lambda _checked=False: self._browse())
+        folder_row.addWidget(self.folder_edit, 1)
+        folder_row.addWidget(browse)
+        layout.addLayout(folder_row)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Имя файла"))
+        self.name_edit = QLineEdit("Preply Vocabulary")
+        self.name_edit.textChanged.connect(lambda _text: self._refresh_preview())
+        name_row.addWidget(self.name_edit, 1)
+        layout.addLayout(name_row)
+
+        self.preview = QLabel("")
+        self.preview.setObjectName("detail")
+        self.preview.setWordWrap(True)
+        self.preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.preview)
+
+        self.success = QLabel("")
+        self.success.setWordWrap(True)
+        self.success.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.success)
+
+        buttons = QHBoxLayout()
+        self.back_button = QPushButton("К списку слов")
+        self.save_button = QPushButton("Сохранить")
+        self.save_button.setObjectName("primary")
+        self.save_button.clicked.connect(lambda _checked=False: self._save())
+        buttons.addWidget(self.back_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.save_button)
+        layout.addStretch(1)
+        layout.addLayout(buttons)
+        self._refresh_preview()
+
+    def set_result(self, temp_path: Path, failures: list[AudioFailure], total: int) -> None:
+        self._temp_path = temp_path
+        self._failures = list(failures)
+        self._saved = False
+        self.success.setText("")
+        self.back_button.setEnabled(True)
+        self.name_edit.setEnabled(True)
+        missed = len(failures)
+        ready = total - missed
+        if missed:
+            names = ", ".join(item.lexeme for item in failures[:8])
+            extra = "" if missed <= 8 else f" и ещё {missed - 8}"
+            self.summary.setText(
+                f"Колода собрана: {total} слов. Аудио скачано: {ready}. "
+                f"Не скачалось: {missed} ({names}{extra}). Эти слова всё равно в колоде."
+            )
+        else:
+            self.summary.setText(f"Колода собрана: {total} слов. Все файлы произношения на месте.")
+        self._refresh_preview()
+
+    def saved(self) -> bool:
+        return self._saved
+
+    def _browse(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Выберите папку для колоды", str(self._folder))
+        if not chosen:
+            return
+        self._folder = Path(chosen)
+        self.folder_edit.setText(str(self._folder))
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        if self._saved:
+            self.save_button.setEnabled(False)
+            return
+        try:
+            path = join_deck_path(self.folder_edit.text(), self.name_edit.text())
+        except ValueError:
+            self.preview.setText("Введите имя файла. Расширение .apkg добавится само.")
+            self.save_button.setEnabled(False)
+            return
+        self.preview.setText(f"Файл будет сохранён:\n{path}")
+        self.save_button.setEnabled(self._temp_path is not None)
+
+    def _save(self) -> None:
+        if self._temp_path is None or not self._temp_path.is_file():
+            QMessageBox.warning(self, "Нет файла", "Колода ещё не собрана.")
+            return
+        try:
+            destination = join_deck_path(self.folder_edit.text(), self.name_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Имя файла", "Введите имя файла.")
+            return
+        if destination.exists():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Файл уже существует")
+            box.setText(f"Заменить существующий файл?\n{destination}")
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            yes_button = box.button(QMessageBox.StandardButton.Yes)
+            no_button = box.button(QMessageBox.StandardButton.No)
+            if yes_button is not None:
+                yes_button.setText("Заменить")
+            if no_button is not None:
+                no_button.setText("Отмена")
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self._temp_path, destination)
+            failure_path = destination.with_suffix(".failures.json")
+            failure_path.write_text(
+                json.dumps([item.to_dict() for item in self._failures], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, "Не сохранилось", f"Не удалось записать файл.\n{exc}")
+            return
+        self._saved = True
+        self.success.setText(f"Колода сохранена:\n{destination}")
+        self.preview.setText(f"Файл будет сохранён:\n{destination}")
+        self.save_button.setEnabled(False)
+        self.back_button.setEnabled(False)
+        self.name_edit.setEnabled(False)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Словарь Preply в Anki")
+        self.resize(920, 700)
+        self.setMinimumSize(760, 560)
+        self._temp_dir: Path | None = None
+        self._build_total = 0
+        self._languages: list[str] = []
+        self._selected_alias = ""
+        self._chooser_needed = False
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        heading = QLabel("Словарь Preply в Anki")
+        heading.setObjectName("title")
+        layout.addWidget(heading)
+
+        self.step_labels = []
+        self.steps_layout = QHBoxLayout()
+        layout.addLayout(self.steps_layout)
+        self._rebuild_steps()
+
+        self.connection = QLabel("Вход в Preply…")
+        self.connection.setObjectName("connection")
+        self.detail = QLabel("Проверка подключения…")
+        self.detail.setObjectName("detail")
+        self.detail.setWordWrap(True)
+        self.profile_label = QLabel("")
+        self.profile_label.setObjectName("detail")
+        self.profile_label.setWordWrap(True)
+        self.profile_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.install_progress = QProgressBar()
+        self.install_progress.setRange(0, 0)
+        self.install_progress.setTextVisible(False)
+        self.install_progress.hide()
+        layout.addWidget(self.connection)
+        layout.addWidget(self.detail)
+        layout.addWidget(self.profile_label)
+        layout.addWidget(self.install_progress)
+
+        self.stack = QStackedWidget()
+        self.login_panel = LoginPanel()
+        self.language_panel = LanguagePanel()
+        self.words_panel = WordListPanel()
+        self.build_panel = BuildPanel()
+        self.save_panel = SavePanel()
+        self.stack.addWidget(self.login_panel)
+        self.stack.addWidget(self.language_panel)
+        self.stack.addWidget(self.words_panel)
+        self.stack.addWidget(self.build_panel)
+        self.stack.addWidget(self.save_panel)
+        layout.addWidget(self.stack, 1)
+
+        self.login_panel.retry_button.clicked.connect(lambda _checked=False: self._retry_connect())
+        self.language_panel.confirm_button.clicked.connect(lambda _checked=False: self._confirm_language())
+        self.words_panel.next_button.clicked.connect(lambda _checked=False: self._start_build())
+        self.words_panel.refresh_button.clicked.connect(lambda _checked=False: self._refresh())
+        self.words_panel.switch_button.clicked.connect(lambda _checked=False: self._show_step(_STEP_LANGUAGE))
+        self.build_panel.back_button.clicked.connect(lambda _checked=False: self._show_step(_STEP_WORDS))
+        self.save_panel.back_button.clicked.connect(lambda _checked=False: self._back_to_words())
+
+        self.worker = ExportWorker()
+        self.worker.status_changed.connect(self._on_status)
+        self.worker.words_ready.connect(self._on_words)
+        self.worker.load_failed.connect(self._on_load_failed)
+        self.worker.profile_ready.connect(self._on_profile)
+        self.worker.connect_failed.connect(self._on_connect_failed)
+        self.worker.build_progress.connect(self._on_build_progress)
+        self.worker.build_ready.connect(self._on_build_ready)
+        self.worker.build_failed.connect(self._on_build_failed)
+        self._show_step(_STEP_LOGIN)
+        self._set_connection("logging_in", "Проверка подключения…")
+        self.words_panel.set_busy(True)
+        self.login_panel.retry_button.setEnabled(False)
+        self.worker.start()
+        self.worker.connect_account()
+
+    def _step_titles(self) -> list[str]:
+        titles = ["Вход"]
+        if self._chooser_needed:
+            titles.append("Язык")
+        titles.extend(["Слова", "Сборка", "Сохранение"])
+        return [f"{index}. {title}" for index, title in enumerate(titles, start=1)]
+
+    def _indicator_index(self, stack_index: int) -> int:
+        if self._chooser_needed:
+            return stack_index
+        if stack_index <= _STEP_LOGIN:
+            return 0
+        return stack_index - 1
+
+    def _rebuild_steps(self) -> None:
+        while self.steps_layout.count():
+            item = self.steps_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self.step_labels = []
+        for text in self._step_titles():
+            label = QLabel(text)
+            label.setObjectName("step")
+            self.step_labels.append(label)
+            self.steps_layout.addWidget(label)
+        self.steps_layout.addStretch(1)
+
+    def _status_visible(self) -> bool:
+        return self.stack.currentIndex() <= _STEP_WORDS
+
+    def _show_step(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+        indicator = self._indicator_index(index)
+        for step, label in enumerate(self.step_labels):
+            label.setProperty("active", step == indicator)
+            label.setProperty("done", step < indicator)
+            self._repolish(label)
+        visible = self._status_visible()
+        self.connection.setVisible(visible)
+        self.detail.setVisible(visible)
+        self.profile_label.setVisible(bool(self.profile_label.text()))
+        self.install_progress.setVisible(visible and self.connection.property("state") == "installing")
+
+    def _set_connection(self, state: str, detail: str) -> None:
+        titles = {
+            "connected": "Подключено",
+            "logging_in": "Вход в Preply…",
+            "installing": "Установка браузера…",
+            "failed": "Нет подключения",
+        }
+        self.connection.setText(titles.get(state, state))
+        self.connection.setProperty("state", state)
+        self._repolish(self.connection)
+        self.detail.setText(detail)
+        self.install_progress.setVisible(self._status_visible() and state == "installing")
+        if state == "failed" and self.stack.currentIndex() == _STEP_LOGIN:
+            self.login_panel.retry_button.setEnabled(True)
+
+    def _repolish(self, widget: QWidget) -> None:
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+
+    def _retry_connect(self) -> None:
+        self.login_panel.retry_button.setEnabled(False)
+        self._show_step(_STEP_LOGIN)
+        self._set_connection("logging_in", "Проверка подключения…")
+        self.worker.retry_connection()
+        if not self.worker.isRunning():
+            self.worker.start()
+
+    def _refresh(self) -> None:
+        subject = self._selected_alias
+        if not subject:
+            return
+        self.words_panel.set_busy(True)
+        self._set_connection("logging_in", "Обновление списка…")
+        self.worker.load(subject)
+
+    def _on_status(self, state: str, detail: str) -> None:
+        if self._status_visible():
+            self._set_connection(state, detail)
+
+    def _on_profile(self, profile: object) -> None:
+        learner = profile if isinstance(profile, LearnerProfile) else None
+        if learner is None:
+            self._on_connect_failed("Не удалось прочитать профиль. Список слов не загружен.")
+            return
+        self.profile_label.setText(format_profile(learner.user_id, learner.display_name))
+        self._languages = list(learner.subject_aliases)
+        action, _subject = language_plan(self._languages)
+        self._chooser_needed = action == "choose"
+        self._rebuild_steps()
+        self.login_panel.retry_button.setEnabled(True)
+        alias = vocabulary_alias(self._languages)
+        if alias:
+            self._open_vocabulary(alias)
+            return
+        if action == "choose":
+            self.language_panel.set_languages([(item, language_label(item)) for item in self._languages])
+            self.words_panel.set_busy(False)
+            self._show_step(_STEP_LANGUAGE)
+            self._set_connection("connected", "Выберите язык. Словарь загрузится после подтверждения.")
+            return
+        self._selected_alias = ""
+        self.words_panel.set_busy(False)
+        self._show_step(_STEP_LOGIN)
+        self._set_connection(
+            "failed",
+            "В аккаунте нет изучаемых языков. Список слов не загружен.",
+        )
+
+    def _confirm_language(self) -> None:
+        try:
+            chosen = vocabulary_alias(self._languages, self.language_panel.selected_alias())
+        except ValueError:
+            chosen = None
+        if not chosen:
+            self._set_connection("failed", "Этот язык не найден в профиле. Список слов не загружен.")
+            return
+        self._open_vocabulary(chosen)
+
+    def _open_vocabulary(self, alias: str) -> None:
+        self._selected_alias = alias
+        self.words_panel.set_language(language_label(alias), alias, self._chooser_needed)
+        self.words_panel.set_busy(True)
+        self._show_step(_STEP_WORDS)
+        self._set_connection("connected", "Загрузка словаря…")
+        self.worker.load(alias)
+
+    def _on_words(self, words: object) -> None:
+        loaded = list(words)
+        self.words_panel.set_words(loaded, keep_checks=True)
+        self.words_panel.set_busy(False)
+        if not loaded and self.stack.currentIndex() == _STEP_WORDS:
+            self._set_connection("connected", "Сохранённых слов нет.")
+
+    def _on_connect_failed(self, message: str) -> None:
+        self.words_panel.set_busy(False)
+        self.login_panel.retry_button.setEnabled(True)
+        self._show_step(_STEP_LOGIN)
+        self._set_connection("failed", message)
+
+    def _on_load_failed(self, message: str) -> None:
+        self.words_panel.set_busy(False)
+        self._show_step(_STEP_WORDS if self._selected_alias else _STEP_LOGIN)
+        self._set_connection("failed", message)
+
+    def _start_build(self) -> None:
+        words = self.words_panel.selected_words()
+        if not words:
+            return
+        self._discard_temp()
+        self._build_total = len(words)
+        self.build_panel.reset(len(words))
+        self._show_step(_STEP_BUILD)
+        self.worker.build(words)
+
+    def _on_build_progress(self, done: int, total: int, text: str) -> None:
+        self.build_panel.show_progress(done, total, text)
+
+    def _on_build_ready(self, path: str, failures: object) -> None:
+        temp_path = Path(path)
+        self._temp_dir = temp_path.parent
+        failure_list = list(failures)
+        self.save_panel.set_result(temp_path, failure_list, self._build_total)
+        self._show_step(_STEP_SAVE)
+
+    def _on_build_failed(self, message: str) -> None:
+        self._show_step(_STEP_BUILD)
+        self.build_panel.show_error(message)
+
+    def _back_to_words(self) -> None:
+        if self.save_panel.saved():
+            return
+        self._show_step(_STEP_WORDS)
+
+    def _discard_temp(self) -> None:
+        if self.save_panel.saved():
+            return
+        if self._temp_dir is not None and self._temp_dir.exists():
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+        self._temp_dir = None
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._discard_temp()
+        self.worker.request_stop()
+        self.worker.wait(30000)
+        super().closeEvent(event)
+
+
+def main(argv: list[str] | None = None) -> int:
+    app = QApplication.instance() or QApplication(argv or sys.argv)
+    if "windowsvista" in QStyleFactory.keys():
+        app.setStyle("windowsvista")
+    app.setFont(QFont("Segoe UI", 11))
+    app.setStyleSheet(_STYLE)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

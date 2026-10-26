@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and local config
+.env
+*.env
+cookies.txt
+cookies.json
+*.cookies
+*.har
+*.failures.json
+
+# Playwright: logged-in browser session and caches
+.preply-profile/
+playwright/.cache/
+**/ms-playwright/
+
+# Built decks and exports
+output/
+*.apkg
+
+# Personal reference deck (note-type model.json may be committed)
+reference/collection.anki2
+reference/media/
+reference/_js/
+reference/*.apkg
+
+# Scratch downloads of the Preply site (not app source)
+_tmp_js/
+_tmp_vocab.html
+
+# IDE / editor
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
