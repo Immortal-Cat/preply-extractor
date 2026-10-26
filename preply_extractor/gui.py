@@ -14,7 +14,6 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -62,7 +61,7 @@ from preply_extractor.preply_api import (
     fetch_vocabulary,
 )
 from preply_extractor.settings_dialog import SettingsDialog
-from preply_extractor.themes import THEME_IDS, apply_theme, normalize_theme
+from preply_extractor.themes import apply_theme, normalize_theme
 from preply_extractor.ui_text import (
     display_word,
     phrase_for_exception,
@@ -928,19 +927,10 @@ class MainWindow(QMainWindow):
         header.setContentsMargins(0, 0, 0, 0)
         self.heading = QLabel(tr("window_title"))
         self.heading.setObjectName("title")
-        self.theme_caption = QLabel(tr("theme"))
-        self.theme_caption.setObjectName("themeCaption")
-        self.theme_combo = QComboBox()
-        self.theme_combo.setObjectName("themeCombo")
-        self.theme_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self._fill_theme_combo()
-        self.theme_combo.currentIndexChanged.connect(self._on_theme_combo)
         self.settings_button = QPushButton(tr("settings"))
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.clicked.connect(self._open_settings)
         header.addWidget(self.heading, 1)
-        header.addWidget(self.theme_caption, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self.theme_combo, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
 
@@ -1272,41 +1262,14 @@ class MainWindow(QMainWindow):
     def _apply_saved_folder(self) -> None:
         self.save_panel.apply_default_folder(load_settings(self._settings_path).default_save_dir)
 
-    def _fill_theme_combo(self) -> None:
-        self.theme_caption.setText(tr("theme"))
-        self.theme_combo.blockSignals(True)
-        self.theme_combo.clear()
-        for theme_id in THEME_IDS:
-            self.theme_combo.addItem(tr(f"theme_{theme_id}"), theme_id)
-        index = self.theme_combo.findData(self._theme)
-        self.theme_combo.setCurrentIndex(index if index >= 0 else 0)
-        self.theme_combo.blockSignals(False)
-
-    def _on_theme_combo(self, index: int) -> None:
-        theme_id = self.theme_combo.itemData(index)
-        if theme_id:
-            self._preview_theme(str(theme_id))
-
     def _preview_theme(self, theme_id: str) -> None:
         """Apply a theme immediately and store it. Settings Cancel rolls that store back."""
         self._apply_theme(theme_id, persist=True)
 
     def _apply_theme(self, theme_id: str, persist: bool) -> None:
         self._theme = apply_theme(QApplication.instance(), theme_id)
-        if hasattr(self, "theme_combo"):
-            self._sync_theme_combo()
         if persist:
             self._persist_theme(self._theme)
-
-    def _sync_theme_combo(self) -> None:
-        index = self.theme_combo.findData(self._theme)
-        if index < 0:
-            index = 0
-        if self.theme_combo.currentIndex() == index:
-            return
-        self.theme_combo.blockSignals(True)
-        self.theme_combo.setCurrentIndex(index)
-        self.theme_combo.blockSignals(False)
 
     def _persist_theme(self, theme_id: str) -> None:
         current = load_settings(self._settings_path)
@@ -1347,7 +1310,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(tr("window_title"))
         self.heading.setText(tr("window_title"))
         self.settings_button.setText(tr("settings"))
-        self._fill_theme_combo()
         self._rebuild_steps()
         self.deps_panel.retranslate()
         if self._dependency_report is not None:
