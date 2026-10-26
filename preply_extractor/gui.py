@@ -660,28 +660,66 @@ class SavePanel(QWidget):
     def set_result(self, temp_path: Path, failures: list[AudioFailure], total: int) -> None:
         self._temp_path = temp_path
         self._failures = list(failures)
+        self._reported_total = total
         self._saved = False
+        self._saved_path = None
         self.success.setText("")
         self.back_button.setEnabled(True)
         self.name_edit.setEnabled(True)
-        missed = len(failures)
-        ready = total - missed
-        if missed:
-            names = ", ".join(item.lexeme for item in failures[:8])
-            extra = "" if missed <= 8 else f" и ещё {missed - 8}"
-            self.summary.setText(
-                f"Колода собрана: {total} слов. Аудио скачано: {ready}. "
-                f"Не скачалось: {missed} ({names}{extra}). Эти слова всё равно в колоде."
-            )
-        else:
-            self.summary.setText(f"Колода собрана: {total} слов. Все файлы произношения на месте.")
+        self._render_summary()
         self._refresh_preview()
 
     def saved(self) -> bool:
         return self._saved
 
+    def apply_default_folder(self, stored: str) -> None:
+        """Use the saved folder when it still exists. Otherwise keep today's default."""
+        if self._saved:
+            return
+        chosen = existing_directory(stored)
+        self._folder = chosen if chosen is not None else default_save_folder()
+        self.folder_edit.setText(str(self._folder))
+        self._refresh_preview()
+
+    def _render_summary(self) -> None:
+        if self._reported_total is None:
+            return
+        total = self._reported_total
+        missed = len(self._failures)
+        ready = total - missed
+        if missed:
+            names = ", ".join(item.lexeme for item in self._failures[:8])
+            extra = "" if missed <= 8 else tr("and_more", count=missed - 8)
+            self.summary.setText(
+                tr(
+                    "deck_ready_partial",
+                    total=total,
+                    ready=ready,
+                    missed=missed,
+                    names=names,
+                    extra=extra,
+                )
+            )
+        else:
+            self.summary.setText(tr("deck_ready_full", total=total))
+
+    def retranslate(self) -> None:
+        self.title.setText(tr("save_title"))
+        self.folder_label.setText(tr("folder"))
+        self.browse_button.setText(tr("browse"))
+        self.name_label.setText(tr("file_name"))
+        self.back_button.setText(tr("back_to_words"))
+        self.save_button.setText(tr("save"))
+        self._render_summary()
+        if self._saved and self._saved_path is not None:
+            self.success.setText(tr("deck_saved", path=self._saved_path))
+            self.preview.setText(tr("file_will_be_saved", path=self._saved_path))
+            self.save_button.setEnabled(False)
+            return
+        self._refresh_preview()
+
     def _browse(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Выберите папку для колоды", str(self._folder))
+        chosen = QFileDialog.getExistingDirectory(self, tr("choose_deck_folder"), str(self._folder))
         if not chosen:
             return
         self._folder = Path(chosen)
@@ -695,33 +733,33 @@ class SavePanel(QWidget):
         try:
             path = join_deck_path(self.folder_edit.text(), self.name_edit.text())
         except ValueError:
-            self.preview.setText("Введите имя файла. Расширение .apkg добавится само.")
+            self.preview.setText(tr("enter_file_name_hint"))
             self.save_button.setEnabled(False)
             return
-        self.preview.setText(f"Файл будет сохранён:\n{path}")
+        self.preview.setText(tr("file_will_be_saved", path=path))
         self.save_button.setEnabled(self._temp_path is not None)
 
     def _save(self) -> None:
         if self._temp_path is None or not self._temp_path.is_file():
-            QMessageBox.warning(self, "Нет файла", "Колода ещё не собрана.")
+            QMessageBox.warning(self, tr("no_file_title"), tr("deck_not_built"))
             return
         try:
             destination = join_deck_path(self.folder_edit.text(), self.name_edit.text())
         except ValueError:
-            QMessageBox.warning(self, "Имя файла", "Введите имя файла.")
+            QMessageBox.warning(self, tr("file_name"), tr("enter_file_name"))
             return
         if destination.exists():
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Question)
-            box.setWindowTitle("Файл уже существует")
-            box.setText(f"Заменить существующий файл?\n{destination}")
+            box.setWindowTitle(tr("file_exists_title"))
+            box.setText(tr("replace_file", path=destination))
             box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             yes_button = box.button(QMessageBox.StandardButton.Yes)
             no_button = box.button(QMessageBox.StandardButton.No)
             if yes_button is not None:
-                yes_button.setText("Заменить")
+                yes_button.setText(tr("replace"))
             if no_button is not None:
-                no_button.setText("Отмена")
+                no_button.setText(tr("cancel"))
             if box.exec() != QMessageBox.StandardButton.Yes:
                 return
         try:
@@ -733,20 +771,28 @@ class SavePanel(QWidget):
                 encoding="utf-8",
             )
         except OSError as exc:
-            QMessageBox.warning(self, "Не сохранилось", f"Не удалось записать файл.\n{exc}")
+            QMessageBox.warning(self, tr("not_saved_title"), tr("could_not_write", error=exc))
             return
         self._saved = True
-        self.success.setText(f"Колода сохранена:\n{destination}")
-        self.preview.setText(f"Файл будет сохранён:\n{destination}")
+        self._saved_path = destination
+        self.success.setText(tr("deck_saved", path=destination))
+        self.preview.setText(tr("file_will_be_saved", path=destination))
         self.save_button.setEnabled(False)
         self.back_button.setEnabled(False)
         self.name_edit.setEnabled(False)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings_file: Path | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("Словарь Preply в Anki")
+        self._settings_path = settings_path() if settings_file is None else settings_file
+        set_language(load_settings(self._settings_path).ui_language)
+        self._status_state = "logging_in"
+        self._status_phrase: tuple = ("key", "checking_connection", {})
+        self._has_profile = False
+        self._profile_user_id: str | None = None
+        self._profile_display_name: str | None = None
+        self.setWindowTitle(tr("window_title"))
         self.resize(920, 700)
         self.setMinimumSize(760, 560)
         self._temp_dir: Path | None = None
@@ -761,18 +807,25 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
-        heading = QLabel("Словарь Preply в Anki")
-        heading.setObjectName("title")
-        layout.addWidget(heading)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        self.heading = QLabel(tr("window_title"))
+        self.heading.setObjectName("title")
+        self.settings_button = QPushButton(tr("settings"))
+        self.settings_button.setObjectName("settingsButton")
+        self.settings_button.clicked.connect(self._open_settings)
+        header.addWidget(self.heading, 1)
+        header.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header)
 
         self.step_labels = []
         self.steps_layout = QHBoxLayout()
         layout.addLayout(self.steps_layout)
         self._rebuild_steps()
 
-        self.connection = QLabel("Вход в Preply…")
+        self.connection = QLabel(tr("state_logging_in"))
         self.connection.setObjectName("connection")
-        self.detail = QLabel("Проверка подключения…")
+        self.detail = QLabel(tr("checking_connection"))
         self.detail.setObjectName("detail")
         self.detail.setWordWrap(True)
         self.profile_label = QLabel("")
@@ -819,18 +872,19 @@ class MainWindow(QMainWindow):
         self.worker.build_ready.connect(self._on_build_ready)
         self.worker.build_failed.connect(self._on_build_failed)
         self._show_step(_STEP_LOGIN)
-        self._set_connection("logging_in", "Проверка подключения…")
+        self._apply_phrase(self._status_state, self._status_phrase)
         self.words_panel.set_busy(True)
         self.login_panel.retry_button.setEnabled(False)
+        self._apply_saved_folder()
         self.worker.start()
         self.worker.connect_account()
 
     def _step_titles(self) -> list[str]:
-        titles = ["Вход"]
+        titles = [tr("step_login")]
         if self._chooser_needed:
-            titles.append("Язык")
-        titles.extend(["Слова", "Сборка", "Сохранение"])
-        return [f"{index}. {title}" for index, title in enumerate(titles, start=1)]
+            titles.append(tr("language_word"))
+        titles.extend([tr("step_words"), tr("step_build"), tr("step_save")])
+        return [tr("step_numbered", index=index, title=title) for index, title in enumerate(titles, start=1)]
 
     def _indicator_index(self, stack_index: int) -> int:
         if self._chooser_needed:
@@ -869,15 +923,11 @@ class MainWindow(QMainWindow):
         self.detail.setVisible(visible)
         self.profile_label.setVisible(bool(self.profile_label.text()))
         self.install_progress.setVisible(visible and self.connection.property("state") == "installing")
+        if self.stack.widget(index) is self.save_panel:
+            self._apply_saved_folder()
 
     def _set_connection(self, state: str, detail: str) -> None:
-        titles = {
-            "connected": "Подключено",
-            "logging_in": "Вход в Preply…",
-            "installing": "Установка браузера…",
-            "failed": "Нет подключения",
-        }
-        self.connection.setText(titles.get(state, state))
+        self.connection.setText(state_title(state))
         self.connection.setProperty("state", state)
         self._repolish(self.connection)
         self.detail.setText(detail)
@@ -893,7 +943,7 @@ class MainWindow(QMainWindow):
     def _retry_connect(self) -> None:
         self.login_panel.retry_button.setEnabled(False)
         self._show_step(_STEP_LOGIN)
-        self._set_connection("logging_in", "Проверка подключения…")
+        self._apply_phrase("logging_in", ("key", "checking_connection", {}))
         self.worker.retry_connection()
         if not self.worker.isRunning():
             self.worker.start()
@@ -903,19 +953,28 @@ class MainWindow(QMainWindow):
         if not subject:
             return
         self.words_panel.set_busy(True)
-        self._set_connection("logging_in", "Обновление списка…")
+        self._apply_phrase("logging_in", ("key", "refreshing_list", {}))
         self.worker.load(subject)
 
     def _on_status(self, state: str, detail: str) -> None:
-        if self._status_visible():
-            self._set_connection(state, detail)
+        item = _pop(self.worker._status_queue)
+        if not self._status_visible():
+            return
+        if item is None:
+            self._apply_phrase(state, ("plain", detail))
+            return
+        queued_state, phrase = item
+        self._apply_phrase(queued_state, phrase)
 
     def _on_profile(self, profile: object) -> None:
         learner = profile if isinstance(profile, LearnerProfile) else None
         if learner is None:
-            self._on_connect_failed("Не удалось прочитать профиль. Список слов не загружен.")
+            self._on_connect_failed_phrase(("key", "profile_unreadable", {}))
             return
-        self.profile_label.setText(format_profile(learner.user_id, learner.display_name))
+        self._has_profile = True
+        self._profile_user_id = learner.user_id
+        self._profile_display_name = learner.display_name
+        self._render_profile()
         self._languages = list(learner.subject_aliases)
         action, _subject = language_plan(self._languages)
         self._chooser_needed = action == "choose"
@@ -929,15 +988,12 @@ class MainWindow(QMainWindow):
             self.language_panel.set_languages([(item, language_label(item)) for item in self._languages])
             self.words_panel.set_busy(False)
             self._show_step(_STEP_LANGUAGE)
-            self._set_connection("connected", "Выберите язык. Словарь загрузится после подтверждения.")
+            self._apply_phrase("connected", ("key", "choose_language_wait", {}))
             return
         self._selected_alias = ""
         self.words_panel.set_busy(False)
         self._show_step(_STEP_LOGIN)
-        self._set_connection(
-            "failed",
-            "В аккаунте нет изучаемых языков. Список слов не загружен.",
-        )
+        self._apply_phrase("failed", ("key", "no_studied_languages", {}))
 
     def _confirm_language(self) -> None:
         try:
@@ -945,7 +1001,7 @@ class MainWindow(QMainWindow):
         except ValueError:
             chosen = None
         if not chosen:
-            self._set_connection("failed", "Этот язык не найден в профиле. Список слов не загружен.")
+            self._apply_phrase("failed", ("key", "language_not_in_profile", {}))
             return
         self._open_vocabulary(chosen)
 
@@ -954,7 +1010,7 @@ class MainWindow(QMainWindow):
         self.words_panel.set_language(language_label(alias), alias, self._chooser_needed)
         self.words_panel.set_busy(True)
         self._show_step(_STEP_WORDS)
-        self._set_connection("connected", "Загрузка словаря…")
+        self._apply_phrase("connected", ("key", "loading_vocab", {}))
         self.worker.load(alias)
 
     def _on_words(self, words: object) -> None:
@@ -962,18 +1018,27 @@ class MainWindow(QMainWindow):
         self.words_panel.set_words(loaded, keep_checks=True)
         self.words_panel.set_busy(False)
         if not loaded and self.stack.currentIndex() == _STEP_WORDS:
-            self._set_connection("connected", "Сохранённых слов нет.")
+            self._apply_phrase("connected", ("key", "no_saved_words", {}))
 
     def _on_connect_failed(self, message: str) -> None:
+        phrase = _pop(self.worker._connect_failed_queue)
+        if phrase is None:
+            phrase = ("plain", message)
+        self._on_connect_failed_phrase(phrase)
+
+    def _on_connect_failed_phrase(self, phrase: tuple) -> None:
         self.words_panel.set_busy(False)
         self.login_panel.retry_button.setEnabled(True)
         self._show_step(_STEP_LOGIN)
-        self._set_connection("failed", message)
+        self._apply_phrase("failed", phrase)
 
     def _on_load_failed(self, message: str) -> None:
+        phrase = _pop(self.worker._load_failed_queue)
+        if phrase is None:
+            phrase = ("plain", message)
         self.words_panel.set_busy(False)
         self._show_step(_STEP_WORDS if self._selected_alias else _STEP_LOGIN)
-        self._set_connection("failed", message)
+        self._apply_phrase("failed", phrase)
 
     def _start_build(self) -> None:
         words = self.words_panel.selected_words()
@@ -986,7 +1051,7 @@ class MainWindow(QMainWindow):
         self.worker.build(words)
 
     def _on_build_progress(self, done: int, total: int, text: str) -> None:
-        self.build_panel.show_progress(done, total, text)
+        self.build_panel.show_progress(done, total, text, _pop(self.worker._progress_queue))
 
     def _on_build_ready(self, path: str, failures: object) -> None:
         temp_path = Path(path)
@@ -997,7 +1062,7 @@ class MainWindow(QMainWindow):
 
     def _on_build_failed(self, message: str) -> None:
         self._show_step(_STEP_BUILD)
-        self.build_panel.show_error(message)
+        self.build_panel.show_error(message, _pop(self.worker._build_failed_queue))
 
     def _back_to_words(self) -> None:
         if self.save_panel.saved():
@@ -1010,6 +1075,46 @@ class MainWindow(QMainWindow):
         if self._temp_dir is not None and self._temp_dir.exists():
             shutil.rmtree(self._temp_dir, ignore_errors=True)
         self._temp_dir = None
+
+    def _apply_phrase(self, state: str, phrase: tuple) -> None:
+        self._status_state = state
+        self._status_phrase = phrase
+        self._set_connection(state, phrase_text(phrase))
+
+    def _render_profile(self) -> None:
+        if not self._has_profile:
+            return
+        self.profile_label.setText(profile_text(self._profile_user_id, self._profile_display_name))
+
+    def _apply_saved_folder(self) -> None:
+        self.save_panel.apply_default_folder(load_settings(self._settings_path).default_save_dir)
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(self, load_settings(self._settings_path))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._commit_settings(dialog.chosen())
+
+    def _commit_settings(self, settings) -> None:
+        save_settings(settings, self._settings_path)
+        set_language(settings.ui_language)
+        self.retranslate()
+        self._apply_saved_folder()
+
+    def retranslate(self) -> None:
+        current = self.stack.currentIndex()
+        self.setWindowTitle(tr("window_title"))
+        self.heading.setText(tr("window_title"))
+        self.settings_button.setText(tr("settings"))
+        self._rebuild_steps()
+        self.login_panel.retranslate()
+        self.language_panel.retranslate()
+        self.words_panel.retranslate()
+        self.build_panel.retranslate()
+        self.save_panel.retranslate()
+        self._render_profile()
+        self._set_connection(self._status_state, phrase_text(self._status_phrase))
+        self._show_step(current)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._discard_temp()
