@@ -39,8 +39,15 @@ from preply_extractor.app_settings import (
     settings_path,
 )
 from preply_extractor.audio import AudioFailure
+from preply_extractor.browser_login import (
+    PREPLY_AUTH_URL,
+    BrowserCookieSession,
+    NoPreplySession,
+    load_default_browser_preply_cookies,
+    open_in_default_browser,
+)
 from preply_extractor.cli import DEFAULT_DECK
-from preply_extractor.deck_job import collect_audio, open_browser_session
+from preply_extractor.deck_job import collect_audio
 from preply_extractor.gui_logic import (
     DEPENDENCY_ORDER,
     BrowserInstallError,
@@ -153,8 +160,9 @@ class ExportWorker(QThread):
         """Queue installation of whatever the report marks missing. Does not open a browser."""
         self._commands.put(("install", None))
 
-    def connect_account(self) -> None:
-        self._commands.put(("connect", None))
+    def use_browser_cookies(self) -> None:
+        """Read the default browser's Preply cookies and continue. Does not launch a browser."""
+        self._commands.put(("cookies", None))
 
     def retry_connection(self) -> None:
         """Close any half-open session, install Chromium if it is missing, then log in again."""
@@ -181,7 +189,7 @@ class ExportWorker(QThread):
                     self._check_dependencies()
                 elif command == "install":
                     self._install_dependencies()
-                elif command in {"connect", "retry"}:
+                elif command in {"cookies", "connect", "retry"}:
                     if command == "retry":
                         self._close_session()
                     self._connect()
@@ -277,14 +285,19 @@ class ExportWorker(QThread):
         if self._stop:
             return
         try:
-            self._ensure_session()
-            if self._stop or self._session is None:
+            cookies = load_default_browser_preply_cookies()
+            if self._stop:
                 return
+            self._close_session()
+            self._session = BrowserCookieSession(cookies, UI_LANGUAGE)
             self._emit_status("connected", ("key", "reading_profile", {}))
             profile = fetch_learner_profile(self._session.post_json, endpoint=self._session.endpoint)
             if self._stop:
                 return
             self.profile_ready.emit(profile)
+        except NoPreplySession:
+            if not self._stop:
+                self._emit_failure(self.connect_failed, self._connect_failed_queue, ("key", "login_not_finished", {}))
         except SessionCancelled:
             return
         except Exception as exc:
@@ -327,23 +340,10 @@ class ExportWorker(QThread):
                 self._emit_failure(self.load_failed, self._load_failed_queue, phrase_for_exception(exc))
 
     def _ensure_session(self) -> None:
-        """Open the Preply browser. Installation belongs to the dependency step, not here."""
+        """Keep using the cookie session. Authorization never opens Playwright."""
         if self._session is not None:
             return
-        if self._stop:
-            return
-        self._emit_status("logging_in", ("key", "opening_browser", {}))
-        self._session = self._open_session()
-
-    def _open_session(self):
-        return open_browser_session(
-            PROFILE_DIR.resolve(),
-            UI_LANGUAGE,
-            "",
-            headless=False,
-            login_timeout=600,
-            should_stop=self.stopping,
-        )
+        raise RuntimeError("Нет подключения к Preply.")
 
     def _on_page(self, label: str, page: int, count: int) -> None:
         self._emit_status("connected", ("key", "category_page", {"label": label, "page": page, "count": count}))
@@ -441,8 +441,12 @@ class LoginPanel(QWidget):
         self.hint.setWordWrap(True)
         self.authorize_button = QPushButton(tr("authorize"))
         self.authorize_button.setObjectName("primary")
+        self.continue_button = QPushButton(tr("signed_in"))
+        self.continue_button.setObjectName("primary")
+        self.continue_button.hide()
         row = QHBoxLayout()
         row.addWidget(self.authorize_button)
+        row.addWidget(self.continue_button)
         row.addStretch(1)
         layout.addWidget(self.hint)
         layout.addLayout(row)
@@ -451,6 +455,7 @@ class LoginPanel(QWidget):
     def retranslate(self) -> None:
         self.hint.setText(tr("login_hint"))
         self.authorize_button.setText(tr("authorize"))
+        self.continue_button.setText(tr("signed_in"))
 
 
 class LanguagePanel(QWidget):
@@ -974,6 +979,7 @@ class MainWindow(QMainWindow):
 
         self.deps_panel.install_button.clicked.connect(lambda _checked=False: self._install_missing())
         self.login_panel.authorize_button.clicked.connect(lambda _checked=False: self._authorize())
+        self.login_panel.continue_button.clicked.connect(lambda _checked=False: self._confirm_login())
         self.language_panel.confirm_button.clicked.connect(lambda _checked=False: self._confirm_language())
         self.words_panel.next_button.clicked.connect(lambda _checked=False: self._start_build())
         self.words_panel.refresh_button.clicked.connect(lambda _checked=False: self._refresh())
@@ -1055,6 +1061,8 @@ class MainWindow(QMainWindow):
         self.install_progress.setVisible(self._status_visible() and state == "installing")
         if state == "failed" and self.stack.currentIndex() == _STEP_LOGIN:
             self.login_panel.authorize_button.setEnabled(True)
+            if self.login_panel.continue_button.isVisible():
+                self.login_panel.continue_button.setEnabled(True)
         if state == "failed" and self.stack.currentIndex() == _STEP_DEPS:
             self.deps_panel.install_button.setEnabled(True)
 
@@ -1086,12 +1094,29 @@ class MainWindow(QMainWindow):
     def _authorize(self) -> None:
         self.login_panel.authorize_button.setEnabled(False)
         try:
-            self._show_step(_STEP_LOGIN)
-            self._apply_phrase("logging_in", ("key", "opening_browser", {}))
-            self._ensure_worker()
-            self.worker.connect_account()
+            open_in_default_browser(PREPLY_AUTH_URL)
         except Exception as exc:
             self.login_panel.authorize_button.setEnabled(True)
+            if self.login_panel.continue_button.isVisible():
+                self.login_panel.continue_button.setEnabled(True)
+            self._show_step(_STEP_LOGIN)
+            self._apply_phrase("failed", phrase_for_exception(exc))
+            return
+        self.login_panel.authorize_button.setEnabled(True)
+        self.login_panel.continue_button.setVisible(True)
+        self.login_panel.continue_button.setEnabled(True)
+        self._show_step(_STEP_LOGIN)
+        self._apply_phrase("ready", ("key", "login_opened", {}))
+
+    def _confirm_login(self) -> None:
+        self.login_panel.continue_button.setEnabled(False)
+        try:
+            self._show_step(_STEP_LOGIN)
+            self._apply_phrase("logging_in", ("key", "reading_profile", {}))
+            self._ensure_worker()
+            self.worker.use_browser_cookies()
+        except Exception as exc:
+            self.login_panel.continue_button.setEnabled(True)
             self._apply_phrase("failed", phrase_for_exception(exc))
 
     def _on_dependencies(self, report: object) -> None:
@@ -1153,6 +1178,8 @@ class MainWindow(QMainWindow):
         self._chooser_needed = action == "choose"
         self._rebuild_steps()
         self.login_panel.authorize_button.setEnabled(True)
+        if self.login_panel.continue_button.isVisible():
+            self.login_panel.continue_button.setEnabled(True)
         alias = vocabulary_alias(self._languages)
         if alias:
             self._open_vocabulary(alias)
@@ -1202,6 +1229,8 @@ class MainWindow(QMainWindow):
     def _on_connect_failed_phrase(self, phrase: tuple) -> None:
         self.words_panel.set_busy(False)
         self.login_panel.authorize_button.setEnabled(True)
+        if self.login_panel.continue_button.isVisible():
+            self.login_panel.continue_button.setEnabled(True)
         self._show_step(_STEP_LOGIN)
         self._apply_phrase("failed", phrase)
 

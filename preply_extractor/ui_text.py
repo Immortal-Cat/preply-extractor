@@ -93,6 +93,15 @@ STRINGS: dict[str, dict[str, str]] = {
         "ru": "Браузер ещё не открыт. Нажмите «Авторизоваться на Preply». Пароль программа не спрашивает.",
         "en": "The browser is not open yet. Click Authorize on Preply. The program does not ask for your password.",
     },
+    "login_opened": {
+        "ru": "Страница входа открыта в браузере по умолчанию. Войдите в свой аккаунт и нажмите «Я вошёл». Пароль программа не спрашивает.",
+        "en": "The sign-in page is open in your default browser. Sign in to your account and click I've signed in. The program does not ask for your password.",
+    },
+    "signed_in": {"ru": "Я вошёл", "en": "I've signed in"},
+    "login_not_finished": {
+        "ru": "В браузере по умолчанию ещё нет входа на preply.com. Завершите вход и нажмите «Я вошёл».",
+        "en": "The default browser does not have a preply.com sign-in yet. Finish signing in and click I've signed in.",
+    },
     "refreshing_list": {"ru": "Обновление списка…", "en": "Refreshing the list…"},
     "reading_profile": {"ru": "Чтение профиля…", "en": "Reading the profile…"},
     "profile_unreadable": {
@@ -145,8 +154,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "downloading_audio": {"ru": "Скачивание произношения…", "en": "Downloading pronunciation…"},
     "writing_deck": {"ru": "Запись файла колоды…", "en": "Writing the deck file…"},
     "login_hint": {
-        "ru": "Компоненты уже проверены. Нажмите кнопку, чтобы открыть браузер и войти в свой аккаунт Preply. Пароль программа не спрашивает и не сохраняет. Пока кнопку не нажать, окно браузера не появится. Вход запоминается в отдельном профиле программы (.preply-profile), а не в обычном Chrome. Аккаунт Google, уже открытый в Chrome на этом компьютере, здесь не виден. Первый вход через Google в этом окне сохранится для следующих запусков.",
-        "en": "The components are already checked. Click the button to open the browser and sign in to your Preply account. The program does not ask for your password or store it. The browser window stays closed until you click. Sign-in is stored in the program's own profile (.preply-profile), not in regular Chrome. A Google account already signed in on this computer's Chrome is not visible here. The first Google sign-in in this window is remembered for later runs.",
+        "ru": "Компоненты уже проверены. Кнопка откроет Preply в вашем обычном браузере, новой вкладкой. Пароль программа не спрашивает и не сохраняет. Когда войдёте, нажмите «Я вошёл».",
+        "en": "The components are already checked. The button opens Preply in your usual browser, as a new tab. The program does not ask for your password or store it. After you sign in, click I've signed in.",
     },
     "retry": {"ru": "Повторить", "en": "Retry"},
     "choose_language_title": {"ru": "Выберите язык", "en": "Choose a language"},

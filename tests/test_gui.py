@@ -257,8 +257,8 @@ class SubjectNormalizationTests(unittest.TestCase):
         self.assertEqual(worker._commands.get_nowait(), ("load", "spanish"))
         worker.load("   ")
         self.assertEqual(worker._commands.get_nowait(), ("load", ""))
-        worker.connect_account()
-        self.assertEqual(worker._commands.get_nowait()[0], "connect")
+        worker.use_browser_cookies()
+        self.assertEqual(worker._commands.get_nowait()[0], "cookies")
         self.assertTrue(worker._commands.empty())
 
     def test_chosen_alias_is_sent_as_subject_alias(self) -> None:
@@ -400,30 +400,33 @@ class BrowserRetryTests(unittest.TestCase):
         self.assertTrue(panel.authorize_button.isEnabled())
         panel.close()
 
-    def test_authorize_opens_the_browser_without_installing(self) -> None:
+    def test_cookie_sign_in_does_not_launch_playwright(self) -> None:
         _app()
         worker = ExportWorker()
+        ready: list[object] = []
+        worker.profile_ready.connect(ready.append)
 
-        def open_session(*_args, **_kwargs):
+        def session_from_cookies(_cookies, _language):
             session = type("Session", (), {})()
             session.endpoint = "/graphql/v2"
             session.post_json = lambda *_a, **_k: (200, "{}")
             session.close = lambda: None
             return session
 
-        ready: list[object] = []
-        worker.profile_ready.connect(ready.append)
         with (
             patch("preply_extractor.gui.subprocess.run") as run,
-            patch("preply_extractor.gui.open_browser_session", side_effect=open_session) as opened,
+            patch("preply_extractor.gui.load_default_browser_preply_cookies", return_value=[{"name": "sessionid", "domain": ".preply.com", "path": "/", "value": "present"}]) as loaded,
+            patch("preply_extractor.gui.BrowserCookieSession", side_effect=session_from_cookies),
+            patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
             patch("preply_extractor.gui.fetch_learner_profile", return_value=object()),
             patch("preply_extractor.gui.fetch_vocabulary") as vocab,
         ):
-            worker.connect_account()
-            self.assertEqual(worker._commands.get_nowait()[0], "connect")
+            worker.use_browser_cookies()
+            self.assertEqual(worker._commands.get_nowait()[0], "cookies")
             worker._connect()
         run.assert_not_called()
-        opened.assert_called_once()
+        loaded.assert_called_once()
+        launched.assert_not_called()
         self.assertEqual(len(ready), 1)
         vocab.assert_not_called()
 
@@ -432,7 +435,7 @@ class BrowserRetryTests(unittest.TestCase):
         worker = ExportWorker()
         order: list[str] = []
 
-        def open_session(*_args, **_kwargs):
+        def session_from_cookies(_cookies, _language):
             order.append("login")
             session = type("Session", (), {})()
             session.endpoint = "/graphql/v2"
@@ -446,13 +449,16 @@ class BrowserRetryTests(unittest.TestCase):
 
         with (
             patch("preply_extractor.gui.subprocess.run") as run,
-            patch("preply_extractor.gui.open_browser_session", side_effect=open_session),
+            patch("preply_extractor.gui.load_default_browser_preply_cookies", return_value=[{"name": "sessionid", "domain": ".preply.com", "path": "/", "value": "present"}]),
+            patch("preply_extractor.gui.BrowserCookieSession", side_effect=session_from_cookies),
+            patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
             patch("preply_extractor.gui.fetch_learner_profile", side_effect=load_profile),
             patch("preply_extractor.gui.fetch_vocabulary") as vocab,
         ):
             worker._close_session()
             worker._connect()
         run.assert_not_called()
+        launched.assert_not_called()
         self.assertEqual(order, ["login", "profile"])
         vocab.assert_not_called()
 
@@ -474,14 +480,12 @@ class BrowserRetryTests(unittest.TestCase):
             patch("preply_extractor.gui_logic.playwright_importable", return_value=True),
             patch("preply_extractor.gui_logic.chromium_executable_exists", return_value=False),
             patch("preply_extractor.gui.subprocess.run", side_effect=run_install),
-            patch("preply_extractor.gui.open_browser_session") as opened,
         ):
             worker._install_dependencies()
         self.assertEqual(len(failed), 1)
         self.assertNotIn("playwright install", failed[0].lower())
         self.assertIn("Исправить", failed[0])
         self.assertIn("network down", failed[0])
-        opened.assert_not_called()
         worker.install_dependencies()
         self.assertEqual(worker._commands.get_nowait()[0], "install")
 
@@ -509,7 +513,7 @@ class BrowserRetryTests(unittest.TestCase):
                 patch("preply_extractor.gui_logic.module_importable", return_value=True),
                 patch("preply_extractor.gui_logic.playwright_importable", return_value=False),
                 patch("preply_extractor.gui.subprocess.run", side_effect=run_install) as run,
-                patch("preply_extractor.gui.open_browser_session") as opened,
+                patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
                 patch("preply_extractor.gui.fetch_vocabulary") as vocab,
             ):
                 worker._install_dependencies()
@@ -519,7 +523,7 @@ class BrowserRetryTests(unittest.TestCase):
             self.assertIn("disk full", failed[0])
             self.assertNotIn("playwright install", failed[0].lower())
             self.assertNotIn("консол", failed[0].lower())
-            opened.assert_not_called()
+            launched.assert_not_called()
             vocab.assert_not_called()
 
 
@@ -541,22 +545,35 @@ class StartupFlowTests(unittest.TestCase):
         self.assertEqual(only_browser[0][-3:], ["playwright", "install", "chromium"])
         self.assertEqual(install_commands_for(_READY), [])
 
-    def test_startup_queues_a_check_and_authorize_is_what_connects(self) -> None:
+    def test_startup_check_does_not_open_a_browser_until_authorize(self) -> None:
         _app()
+        from preply_extractor.browser_login import PREPLY_AUTH_URL
+
+        opened: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
             with (
                 patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
-                patch("preply_extractor.gui.open_browser_session") as opened,
+                patch("preply_extractor.gui.open_in_default_browser", side_effect=opened.append),
+                patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
             ):
                 window = MainWindow(settings_file=path)
+                window.show()
                 try:
                     self.assertEqual(window.stack.currentIndex(), _STEP_DEPS)
                     self.assertEqual(window.worker._commands.get_nowait()[0], "check")
-                    opened.assert_not_called()
+                    self.assertFalse(hasattr(window, "theme_combo"))
+                    launched.assert_not_called()
+                    self.assertEqual(opened, [])
                     window.login_panel.authorize_button.click()
-                    self.assertEqual(window.worker._commands.get_nowait()[0], "connect")
-                    opened.assert_not_called()
+                    self.assertEqual(opened, [PREPLY_AUTH_URL])
+                    self.assertTrue(opened[0].startswith("https://"))
+                    self.assertFalse(window.login_panel.continue_button.isHidden())
+                    self.assertTrue(window.worker._commands.empty())
+                    launched.assert_not_called()
+                    window.login_panel.continue_button.click()
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "cookies")
+                    launched.assert_not_called()
                 finally:
                     window.close()
 
@@ -566,7 +583,7 @@ class StartupFlowTests(unittest.TestCase):
             path = Path(tmp) / "settings.json"
             with (
                 patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
-                patch("preply_extractor.gui.open_browser_session") as opened,
+                patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
             ):
                 window = MainWindow(settings_file=path)
                 try:
@@ -574,7 +591,7 @@ class StartupFlowTests(unittest.TestCase):
                     self.assertEqual(window.stack.currentIndex(), _STEP_LOGIN)
                     self.assertIn("Авторизоваться", window.login_panel.authorize_button.text())
                     self.assertFalse(window.deps_panel.install_button.isVisible())
-                    opened.assert_not_called()
+                    launched.assert_not_called()
                     self.assertEqual(window.worker._commands.get_nowait()[0], "check")
                 finally:
                     window.close()
@@ -585,7 +602,7 @@ class StartupFlowTests(unittest.TestCase):
             path = Path(tmp) / "settings.json"
             with (
                 patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
-                patch("preply_extractor.gui.open_browser_session") as opened,
+                patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
             ):
                 window = MainWindow(settings_file=path)
                 try:
@@ -595,13 +612,126 @@ class StartupFlowTests(unittest.TestCase):
                     self.assertEqual(window.deps_panel.install_button.text(), "Установить")
                     self.assertIn("Playwright: не установлено", window.deps_panel.lines.text())
                     self.assertIn("Chromium: не установлено", window.deps_panel.lines.text())
-                    opened.assert_not_called()
+                    launched.assert_not_called()
                     window.worker._commands.get_nowait()
                     window.deps_panel.install_button.click()
                     self.assertEqual(window.worker._commands.get_nowait()[0], "install")
-                    opened.assert_not_called()
+                    launched.assert_not_called()
                 finally:
                     window.close()
+
+
+class DefaultBrowserTests(unittest.TestCase):
+    def test_progid_selects_the_cookie_store(self) -> None:
+        from preply_extractor.browser_login import browser_family
+
+        self.assertEqual(browser_family("FirefoxURL-308046B0AF4A39CB"), "firefox")
+        self.assertEqual(browser_family("ChromeHTML"), "chrome")
+        self.assertEqual(browser_family("MSEdgeHTM"), "edge")
+
+    def test_open_uses_the_https_handler_and_not_a_custom_profile(self) -> None:
+        from preply_extractor.browser_login import PREPLY_AUTH_URL, open_in_default_browser
+
+        seen: list[str] = []
+        open_in_default_browser(PREPLY_AUTH_URL, opener=seen.append)
+        self.assertEqual(seen, [PREPLY_AUTH_URL])
+        self.assertTrue(seen[0].startswith("https://"))
+        self.assertNotIn("user-data-dir", seen[0])
+        self.assertNotIn(".preply-profile", seen[0])
+
+    def test_firefox_cookies_ignore_other_sites_and_require_a_session(self) -> None:
+        import sqlite3
+
+        from preply_extractor.browser_login import NoPreplySession, read_firefox_cookies, require_preply_session
+
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "cookies.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE moz_cookies (host TEXT, name TEXT, value TEXT, path TEXT)")
+            connection.executemany(
+                "INSERT INTO moz_cookies VALUES (?, ?, ?, ?)",
+                [
+                    (".preply.com", "sessionid", "signed-in", "/"),
+                    (".preply.com", "csrftoken", "token", "/"),
+                    (".google.com", "SID", "other-site", "/"),
+                ],
+            )
+            connection.commit()
+            connection.close()
+            cookies = read_firefox_cookies(database)
+            names = [cookie["name"] for cookie in cookies]
+            hosts = [str(cookie["domain"]) for cookie in cookies]
+            self.assertEqual(names, ["sessionid", "csrftoken"])
+            self.assertTrue(all(host.endswith("preply.com") for host in hosts))
+            self.assertFalse(any("google.com" in host for host in hosts))
+            self.assertNotIn("SID", names)
+            self.assertEqual([cookie["name"] for cookie in require_preply_session(cookies)], names)
+            with self.assertRaises(NoPreplySession):
+                require_preply_session([cookie for cookie in cookies if cookie["name"] != "sessionid"])
+
+    def test_firefox_profile_comes_from_profiles_ini(self) -> None:
+        from preply_extractor.browser_login import _firefox_profile_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "Profiles" / "abc.default-release"
+            profile.mkdir(parents=True)
+            (root / "Profiles" / "other").mkdir()
+            ini = root / "profiles.ini"
+            ini.write_text(
+                "[Install1]\nDefault=Profiles/abc.default-release\nLocked=1\n\n"
+                "[Profile0]\nName=other\nIsRelative=1\nPath=Profiles/other\nDefault=1\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_firefox_profile_dir(ini), profile)
+
+    def test_chromium_cookies_use_that_profiles_database(self) -> None:
+        import sqlite3
+
+        from preply_extractor.browser_login import read_chromium_cookies
+
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "Cookies"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO cookies VALUES (?, ?, ?, ?, ?)",
+                [
+                    (".preply.com", "sessionid", "signed-in", b"", "/"),
+                    ("accounts.google.com", "SID", "other-site", b"", "/"),
+                ],
+            )
+            connection.commit()
+            connection.close()
+            cookies = read_chromium_cookies(database, None)
+            names = [cookie["name"] for cookie in cookies]
+            hosts = [str(cookie["domain"]) for cookie in cookies]
+            self.assertEqual(names, ["sessionid"])
+            self.assertTrue(all(host.endswith("preply.com") for host in hosts))
+            self.assertFalse(any("google" in host for host in hosts))
+
+    def test_missing_session_cookie_does_not_open_playwright(self) -> None:
+        _app()
+        from preply_extractor.browser_login import NoPreplySession
+
+        worker = ExportWorker()
+        failed: list[str] = []
+        worker.connect_failed.connect(failed.append)
+        with (
+            patch(
+                "preply_extractor.gui.load_default_browser_preply_cookies",
+                side_effect=NoPreplySession("no preply.com session cookie"),
+            ),
+            patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
+        ):
+            worker._connect()
+        launched.assert_not_called()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("preply.com", failed[0])
+        self.assertIn("Я вошёл", failed[0])
+        self.assertNotIn("signed-in", failed[0])
 
 
 class ChromeProfileTests(unittest.TestCase):
