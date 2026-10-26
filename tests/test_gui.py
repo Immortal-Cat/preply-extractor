@@ -23,7 +23,10 @@ from preply_extractor.gui import (
     ExportWorker,
     LanguagePanel,
     LoginPanel,
+    MainWindow,
     WordListPanel,
+    _STEP_DEPS,
+    _STEP_LOGIN,
     russian_error,
 )
 from preply_extractor.gui_logic import (
@@ -31,6 +34,7 @@ from preply_extractor.gui_logic import (
     ensure_playwright_chromium,
     format_profile,
     install_chromium_command,
+    install_commands_for,
     install_playwright_package_command,
     join_deck_path,
     missing_browser_message,
@@ -377,62 +381,40 @@ class BrowserRetryTests(unittest.TestCase):
             self.assertNotIn("console", lowered)
             self.assertIn("Повторить", text)
 
-    def test_retry_button_invokes_its_slot(self) -> None:
+    def test_authorize_button_invokes_its_slot(self) -> None:
         _app()
         panel = LoginPanel()
         calls: list[str] = []
-        panel.retry_button.clicked.connect(lambda _checked=False: calls.append("retry"))
-        panel.retry_button.click()
-        self.assertEqual(calls, ["retry"])
-        self.assertTrue(panel.retry_button.isEnabled())
+        panel.authorize_button.clicked.connect(lambda _checked=False: calls.append("authorize"))
+        panel.authorize_button.click()
+        self.assertEqual(calls, ["authorize"])
+        self.assertTrue(panel.authorize_button.isEnabled())
         panel.close()
 
-    def test_retry_installs_when_browser_is_missing_then_logs_in(self) -> None:
+    def test_authorize_opens_the_browser_without_installing(self) -> None:
         _app()
         worker = ExportWorker()
-        order: list[str] = []
-
-        def exists() -> bool:
-            order.append("check")
-            return False
-
-        def run_install(*_args, **_kwargs):
-            order.append("install")
-            completed = type("Completed", (), {})()
-            completed.returncode = 0
-            completed.stderr = ""
-            completed.stdout = ""
-            return completed
 
         def open_session(*_args, **_kwargs):
-            order.append("login")
             session = type("Session", (), {})()
             session.endpoint = "/graphql/v2"
             session.post_json = lambda *_a, **_k: (200, "{}")
             session.close = lambda: None
             return session
 
-        def load_profile(*_args, **_kwargs):
-            order.append("profile")
-            return object()
-
         ready: list[object] = []
         worker.profile_ready.connect(ready.append)
         with (
-            patch("preply_extractor.gui.playwright_importable", return_value=True),
-            patch("preply_extractor.gui.chromium_executable_exists", side_effect=exists),
-            patch("preply_extractor.gui.subprocess.run", side_effect=run_install) as run,
-            patch("preply_extractor.gui.open_browser_session", side_effect=open_session),
-            patch("preply_extractor.gui.fetch_learner_profile", side_effect=load_profile),
+            patch("preply_extractor.gui.subprocess.run") as run,
+            patch("preply_extractor.gui.open_browser_session", side_effect=open_session) as opened,
+            patch("preply_extractor.gui.fetch_learner_profile", return_value=object()),
             patch("preply_extractor.gui.fetch_vocabulary") as vocab,
         ):
-            worker.retry_connection()
-            command, _payload = worker._commands.get_nowait()
-            self.assertEqual(command, "retry")
-            worker._close_session()
+            worker.connect_account()
+            self.assertEqual(worker._commands.get_nowait()[0], "connect")
             worker._connect()
-            self.assertEqual(run.call_args.args[0], install_chromium_command())
-        self.assertEqual(order, ["check", "install", "login", "profile"])
+        run.assert_not_called()
+        opened.assert_called_once()
         self.assertEqual(len(ready), 1)
         vocab.assert_not_called()
 
@@ -454,8 +436,6 @@ class BrowserRetryTests(unittest.TestCase):
             return object()
 
         with (
-            patch("preply_extractor.gui.playwright_importable", return_value=True),
-            patch("preply_extractor.gui.chromium_executable_exists", return_value=True),
             patch("preply_extractor.gui.subprocess.run") as run,
             patch("preply_extractor.gui.open_browser_session", side_effect=open_session),
             patch("preply_extractor.gui.fetch_learner_profile", side_effect=load_profile),
@@ -471,7 +451,7 @@ class BrowserRetryTests(unittest.TestCase):
         _app()
         worker = ExportWorker()
         failed: list[str] = []
-        worker.connect_failed.connect(failed.append)
+        worker.dependency_failed.connect(failed.append)
 
         def run_install(*_args, **_kwargs):
             completed = type("Completed", (), {})()
@@ -481,19 +461,20 @@ class BrowserRetryTests(unittest.TestCase):
             return completed
 
         with (
-            patch("preply_extractor.gui.playwright_importable", return_value=True),
-            patch("preply_extractor.gui.chromium_executable_exists", return_value=False),
+            patch("preply_extractor.gui_logic.module_importable", return_value=True),
+            patch("preply_extractor.gui_logic.playwright_importable", return_value=True),
+            patch("preply_extractor.gui_logic.chromium_executable_exists", return_value=False),
             patch("preply_extractor.gui.subprocess.run", side_effect=run_install),
             patch("preply_extractor.gui.open_browser_session") as opened,
         ):
-            worker._connect()
+            worker._install_dependencies()
         self.assertEqual(len(failed), 1)
         self.assertNotIn("playwright install", failed[0].lower())
-        self.assertIn("Повторить", failed[0])
+        self.assertIn("Исправить", failed[0])
         self.assertIn("network down", failed[0])
         opened.assert_not_called()
-        worker.retry_connection()
-        self.assertEqual(worker._commands.get_nowait()[0], "retry")
+        worker.install_dependencies()
+        self.assertEqual(worker._commands.get_nowait()[0], "install")
 
     def test_retry_under_pythonw_uses_python_exe_and_shows_stderr(self) -> None:
         _app()
@@ -513,17 +494,16 @@ class BrowserRetryTests(unittest.TestCase):
                 return completed
 
             failed: list[str] = []
-            worker.connect_failed.connect(failed.append)
+            worker.dependency_failed.connect(failed.append)
             with (
                 patch("preply_extractor.gui_logic.sys.executable", str(pythonw)),
-                patch("preply_extractor.gui.playwright_importable", return_value=True),
-                patch("preply_extractor.gui.chromium_executable_exists", return_value=False),
+                patch("preply_extractor.gui_logic.module_importable", return_value=True),
+                patch("preply_extractor.gui_logic.playwright_importable", return_value=False),
                 patch("preply_extractor.gui.subprocess.run", side_effect=run_install) as run,
                 patch("preply_extractor.gui.open_browser_session") as opened,
                 patch("preply_extractor.gui.fetch_vocabulary") as vocab,
             ):
-                worker._close_session()
-                worker._connect()
+                worker._install_dependencies()
             self.assertEqual(run.call_args.args[0][0], str(python))
             self.assertFalse(Path(run.call_args.args[0][0]).name.lower().startswith("pythonw"))
             self.assertEqual(len(failed), 1)
@@ -532,6 +512,87 @@ class BrowserRetryTests(unittest.TestCase):
             self.assertNotIn("консол", failed[0].lower())
             opened.assert_not_called()
             vocab.assert_not_called()
+
+
+_READY = {"pyside6": True, "requests": True, "playwright": True, "chromium": True}
+
+
+class StartupFlowTests(unittest.TestCase):
+    def test_install_commands_cover_only_what_is_missing(self) -> None:
+        missing_package = install_commands_for(
+            {"pyside6": True, "requests": True, "playwright": False, "chromium": False}
+        )
+        self.assertEqual(len(missing_package), 2)
+        self.assertEqual(missing_package[0][1:4], ["-m", "pip", "install"])
+        self.assertEqual(missing_package[0][-1], "playwright==1.49.1")
+        self.assertEqual(missing_package[1][-3:], ["playwright", "install", "chromium"])
+        self.assertFalse(Path(missing_package[0][0]).name.lower().startswith("pythonw"))
+        only_browser = install_commands_for({**_READY, "chromium": False})
+        self.assertEqual(len(only_browser), 1)
+        self.assertEqual(only_browser[0][-3:], ["playwright", "install", "chromium"])
+        self.assertEqual(install_commands_for(_READY), [])
+
+    def test_startup_queues_a_check_and_authorize_is_what_connects(self) -> None:
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with (
+                patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
+                patch("preply_extractor.gui.open_browser_session") as opened,
+            ):
+                window = MainWindow(settings_file=path)
+                try:
+                    self.assertEqual(window.stack.currentIndex(), _STEP_DEPS)
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "check")
+                    opened.assert_not_called()
+                    window.login_panel.authorize_button.click()
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "connect")
+                    opened.assert_not_called()
+                finally:
+                    window.close()
+
+    def test_ready_dependencies_advance_without_opening_a_browser(self) -> None:
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with (
+                patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
+                patch("preply_extractor.gui.open_browser_session") as opened,
+            ):
+                window = MainWindow(settings_file=path)
+                try:
+                    window._on_dependencies(dict(_READY))
+                    self.assertEqual(window.stack.currentIndex(), _STEP_LOGIN)
+                    self.assertIn("Авторизоваться", window.login_panel.authorize_button.text())
+                    self.assertFalse(window.deps_panel.install_button.isVisible())
+                    opened.assert_not_called()
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "check")
+                finally:
+                    window.close()
+
+    def test_missing_playwright_shows_install_and_does_not_open_a_browser(self) -> None:
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with (
+                patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
+                patch("preply_extractor.gui.open_browser_session") as opened,
+            ):
+                window = MainWindow(settings_file=path)
+                try:
+                    window._on_dependencies({**_READY, "playwright": False, "chromium": False})
+                    self.assertEqual(window.stack.currentIndex(), _STEP_DEPS)
+                    self.assertTrue(window.deps_panel.install_button.isEnabled())
+                    self.assertEqual(window.deps_panel.install_button.text(), "Установить")
+                    self.assertIn("Playwright: не установлено", window.deps_panel.lines.text())
+                    self.assertIn("Chromium: не установлено", window.deps_panel.lines.text())
+                    opened.assert_not_called()
+                    window.worker._commands.get_nowait()
+                    window.deps_panel.install_button.click()
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "install")
+                    opened.assert_not_called()
+                finally:
+                    window.close()
 
 
 if __name__ == "__main__":

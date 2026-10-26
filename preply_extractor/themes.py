@@ -135,6 +135,8 @@ QLabel#detail, QLabel#themeCaption {
     color: __MUTED__;
 }
 QLabel#connection[state="connected"] { color: __CONNECTED__; font-weight: 600; }
+QLabel#connection[state="checking"] { color: __INSTALLING__; font-weight: 600; }
+QLabel#connection[state="ready"] { color: __CONNECTED__; font-weight: 600; }
 QLabel#connection[state="logging_in"] { color: __LOGGING_IN__; font-weight: 600; }
 QLabel#connection[state="installing"] { color: __INSTALLING__; font-weight: 600; }
 QLabel#connection[state="failed"] { color: __FAILED__; font-weight: 600; }

@@ -184,8 +184,9 @@ class SettingsWindowTests(unittest.TestCase):
                     self.assertEqual(load_settings(path), AppSettings("en", str(folder)))
                     self.assertEqual(window.windowTitle(), "Preply vocabulary to Anki")
                     self.assertEqual(window.settings_button.text(), "Settings")
-                    self.assertEqual(window.login_panel.retry_button.text(), "Retry")
-                    self.assertIn("Sign in", window.step_labels[0].text())
+                    self.assertEqual(window.login_panel.authorize_button.text(), "Authorize on Preply")
+                    self.assertIn("Components", window.step_labels[0].text())
+                    self.assertIn("Sign in", window.step_labels[1].text())
                     self.assertEqual(Path(window.save_panel.folder_edit.text()), folder)
 
                     other = Path(tmp) / "other"

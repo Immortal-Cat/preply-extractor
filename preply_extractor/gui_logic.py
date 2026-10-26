@@ -222,6 +222,68 @@ def ensure_playwright_chromium(*, installed: bool, run=run_chromium_install) -> 
     return True
 
 
+PYSIDE6_PIP_SPEC = "PySide6==6.9.2"
+REQUESTS_PIP_SPEC = "requests==2.32.3"
+DEPENDENCY_ORDER = ("pyside6", "requests", "playwright", "chromium")
+
+
+def module_importable(module_name: str) -> bool:
+    """True when ``module_name`` imports. A missing package is reported, not installed."""
+    try:
+        __import__(module_name)
+    except ImportError:
+        return False
+    return True
+
+
+def inspect_dependencies() -> dict[str, bool]:
+    """Report hard dependencies. Does not download anything and does not open a browser."""
+    playwright_ok = playwright_importable()
+    return {
+        "pyside6": module_importable("PySide6"),
+        "requests": module_importable("requests"),
+        "playwright": playwright_ok,
+        "chromium": chromium_executable_exists() if playwright_ok else False,
+    }
+
+
+def dependencies_ready(report: dict[str, bool]) -> bool:
+    return all(report.get(key) for key in DEPENDENCY_ORDER)
+
+
+def pip_install_command(spec: str, executable: str | None = None) -> list[str]:
+    return [console_python(executable), "-m", "pip", "install", spec]
+
+
+def install_commands_for(report: dict[str, bool], executable: str | None = None) -> list[list[str]]:
+    """Commands that install only the components marked missing. Uses python.exe, never pythonw."""
+    commands: list[list[str]] = []
+    if not report.get("pyside6"):
+        commands.append(pip_install_command(PYSIDE6_PIP_SPEC, executable))
+    if not report.get("requests"):
+        commands.append(pip_install_command(REQUESTS_PIP_SPEC, executable))
+    if not report.get("playwright"):
+        commands.append(install_playwright_package_command(executable))
+    if not report.get("chromium"):
+        commands.append(install_chromium_command(executable))
+    return commands
+
+
+def install_missing_dependencies(report: dict[str, bool], run, executable: str | None = None) -> list[list[str]]:
+    """Run the install command for each missing component.
+
+    ``run`` receives a command and returns ``(exit_code, output)``.
+    A non-zero exit raises ``BrowserInstallError`` with that output.
+    """
+    started: list[list[str]] = []
+    for command in install_commands_for(report, executable):
+        started.append(list(command))
+        code, output = run(command)
+        if code != 0:
+            raise BrowserInstallError(code, output)
+    return started
+
+
 def prepare_playwright_runtime(*, package_installed: bool, chromium_installed: bool, run) -> list[list[str]]:
     """Install the Playwright package if import fails, then Chromium if the browser is missing.
 

@@ -43,13 +43,15 @@ from preply_extractor.audio import AudioFailure
 from preply_extractor.cli import DEFAULT_DECK
 from preply_extractor.deck_job import collect_audio, open_browser_session
 from preply_extractor.gui_logic import (
-    chromium_executable_exists,
-    is_missing_chromium_error,
+    DEPENDENCY_ORDER,
+    BrowserInstallError,
+    _install_failure_detail,
+    dependencies_ready,
+    inspect_dependencies,
+    install_missing_dependencies,
     join_deck_path,
     language_label,
     language_plan,
-    playwright_importable,
-    prepare_playwright_runtime,
     vocabulary_alias,
     word_key,
 )
@@ -76,11 +78,12 @@ PROFILE_DIR = Path(".preply-profile")
 PAGE_SIZE = 20
 PAGE_DELAY = 0.25
 UI_LANGUAGE = "en"
-_STEP_LOGIN = 0
-_STEP_LANGUAGE = 1
-_STEP_WORDS = 2
-_STEP_BUILD = 3
-_STEP_SAVE = 4
+_STEP_DEPS = 0
+_STEP_LOGIN = 1
+_STEP_LANGUAGE = 2
+_STEP_WORDS = 3
+_STEP_BUILD = 4
+_STEP_SAVE = 5
 
 
 def russian_error(exc: BaseException) -> str:
@@ -110,6 +113,8 @@ class ExportWorker(QThread):
     load_failed = Signal(str)
     profile_ready = Signal(object)
     connect_failed = Signal(str)
+    dependencies_checked = Signal(object)
+    dependency_failed = Signal(str)
     build_progress = Signal(int, int, str)
     build_ready = Signal(str, object)
     build_failed = Signal(str)
@@ -120,6 +125,7 @@ class ExportWorker(QThread):
         self._status_queue: queue.Queue = queue.Queue()
         self._load_failed_queue: queue.Queue = queue.Queue()
         self._connect_failed_queue: queue.Queue = queue.Queue()
+        self._dependency_failed_queue: queue.Queue = queue.Queue()
         self._build_failed_queue: queue.Queue = queue.Queue()
         self._progress_queue: queue.Queue = queue.Queue()
         self._session = None
@@ -139,6 +145,14 @@ class ExportWorker(QThread):
     def _emit_progress(self, done: int, total: int, phrase: tuple) -> None:
         self._progress_queue.put(phrase)
         self.build_progress.emit(done, total, phrase_text(phrase))
+
+    def check_dependencies(self) -> None:
+        """Queue a dependency report. Does not open a browser."""
+        self._commands.put(("check", None))
+
+    def install_dependencies(self) -> None:
+        """Queue installation of whatever the report marks missing. Does not open a browser."""
+        self._commands.put(("install", None))
 
     def connect_account(self) -> None:
         self._commands.put(("connect", None))
@@ -164,7 +178,11 @@ class ExportWorker(QThread):
                 self._close_session()
                 return
             try:
-                if command in {"connect", "retry"}:
+                if command == "check":
+                    self._check_dependencies()
+                elif command == "install":
+                    self._install_dependencies()
+                elif command in {"connect", "retry"}:
                     if command == "retry":
                         self._close_session()
                     self._connect()
@@ -174,7 +192,27 @@ class ExportWorker(QThread):
                     self._build(list(payload))
             except Exception as exc:
                 self._close_session()
-                self._report_worker_error(exc)
+                if command in {"check", "install"}:
+                    self._report_dependency_error(exc)
+                else:
+                    self._report_worker_error(exc)
+
+    def _report_dependency_error(self, exc: BaseException) -> None:
+        if self._stop:
+            return
+        self._emit_dependency_failure(self._dependency_phrase(exc))
+
+    def _dependency_phrase(self, exc: BaseException) -> tuple:
+        if isinstance(exc, BrowserInstallError):
+            reason = _install_failure_detail(exc.output or str(exc))
+            if reason:
+                return ("key", "deps_install_failed", {"reason": reason})
+            return ("key", "deps_install_failed_plain", {})
+        return phrase_for_exception(exc)
+
+    def _emit_dependency_failure(self, phrase: tuple) -> None:
+        self._dependency_failed_queue.put(phrase)
+        self.dependency_failed.emit(phrase_text(phrase))
 
     def _report_worker_error(self, exc: BaseException) -> None:
         """Keep installer and login failures in the window. pythonw hides stderr."""
@@ -184,6 +222,57 @@ class ExportWorker(QThread):
             self._emit_failure(self.connect_failed, self._connect_failed_queue, phrase_for_exception(exc))
         except Exception:
             self.connect_failed.emit(str(exc).strip() or "error")
+
+    def _check_dependencies(self) -> None:
+        if self._stop:
+            return
+        self._emit_status("checking", ("key", "checking_components", {}))
+        report = inspect_dependencies()
+        if self._stop:
+            return
+        self.dependencies_checked.emit(report)
+
+    def _install_dependencies(self) -> None:
+        if self._stop:
+            return
+        try:
+            report = inspect_dependencies()
+
+            def run(command: list[str]) -> tuple[int, str]:
+                if self._stop:
+                    raise SessionCancelled("closed")
+                name = "Chromium" if command[-1] == "chromium" else command[-1].split("==", 1)[0]
+                self._emit_status("installing", ("key", "installing_named", {"name": name}))
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    creationflags=flags,
+                )
+                output = "\n".join(
+                    part.strip() for part in (completed.stderr, completed.stdout) if part and part.strip()
+                )
+                return completed.returncode, output
+
+            install_missing_dependencies(report, run)
+        except SessionCancelled:
+            return
+        except Exception as exc:
+            if not self._stop:
+                try:
+                    self.dependencies_checked.emit(inspect_dependencies())
+                except Exception:
+                    pass
+                self._report_dependency_error(exc)
+            return
+        if self._stop:
+            return
+        fresh = inspect_dependencies()
+        self.dependencies_checked.emit(fresh)
+        if not dependencies_ready(fresh):
+            self._emit_dependency_failure(("key", "deps_still_missing", {}))
 
     def _connect(self) -> None:
         if self._stop:
@@ -239,22 +328,13 @@ class ExportWorker(QThread):
                 self._emit_failure(self.load_failed, self._load_failed_queue, phrase_for_exception(exc))
 
     def _ensure_session(self) -> None:
+        """Open the Preply browser. Installation belongs to the dependency step, not here."""
         if self._session is not None:
             return
-        self._install_chromium_if_missing()
         if self._stop:
             return
         self._emit_status("logging_in", ("key", "opening_browser", {}))
-        try:
-            self._session = self._open_session()
-        except Exception as exc:
-            if self._stop or not is_missing_chromium_error(str(exc)):
-                raise
-            self._install_chromium_if_missing(force=True)
-            if self._stop:
-                return
-            self._emit_status("logging_in", ("key", "opening_browser", {}))
-            self._session = self._open_session()
+        self._session = self._open_session()
 
     def _open_session(self):
         return open_browser_session(
@@ -264,31 +344,6 @@ class ExportWorker(QThread):
             headless=False,
             login_timeout=600,
             should_stop=self.stopping,
-        )
-
-    def _install_chromium_if_missing(self, force: bool = False) -> None:
-        package_installed = playwright_importable()
-        chromium_installed = False if force or not package_installed else chromium_executable_exists()
-
-        def run(command: list[str]) -> tuple[int, str]:
-            if self._stop:
-                raise SessionCancelled("closed")
-            self._emit_status("installing", ("key", "installing_browser_detail", {}))
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                creationflags=flags,
-            )
-            output = "\n".join(part.strip() for part in (completed.stderr, completed.stdout) if part and part.strip())
-            return completed.returncode, output
-
-        prepare_playwright_runtime(
-            package_installed=package_installed,
-            chromium_installed=chromium_installed,
-            run=run,
         )
 
     def _on_page(self, label: str, page: int, count: int) -> None:
@@ -330,6 +385,53 @@ class ExportWorker(QThread):
             session.close()
 
 
+class DependencyPanel(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        self.title = QLabel(tr("deps_title"))
+        self.title.setObjectName("title")
+        self.hint = QLabel(tr("deps_hint"))
+        self.hint.setWordWrap(True)
+        self.lines = QLabel("")
+        self.lines.setObjectName("detail")
+        self.lines.setWordWrap(True)
+        self.lines.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.install_button = QPushButton(tr("install_components"))
+        self.install_button.setObjectName("primary")
+        self.install_button.setEnabled(False)
+        self.install_button.hide()
+        self._repair = False
+        row = QHBoxLayout()
+        row.addWidget(self.install_button)
+        row.addStretch(1)
+        layout.addWidget(self.title)
+        layout.addWidget(self.hint)
+        layout.addWidget(self.lines)
+        layout.addLayout(row)
+        layout.addStretch(1)
+
+    def show_report(self, report: dict[str, bool], *, repair: bool) -> None:
+        rows = []
+        for key in DEPENDENCY_ORDER:
+            name = tr(f"component_{key}")
+            state_key = "component_ok" if report.get(key) else "component_missing"
+            rows.append(tr(state_key, name=name))
+        self.lines.setText("\n".join(rows))
+        ready = dependencies_ready(report)
+        self._repair = repair and not ready
+        self.install_button.setVisible(not ready)
+        self.install_button.setEnabled(not ready)
+        self.install_button.setText(tr("repair_components" if self._repair else "install_components"))
+
+    def retranslate(self) -> None:
+        self.title.setText(tr("deps_title"))
+        self.hint.setText(tr("deps_hint"))
+        self.install_button.setText(tr("repair_components" if self._repair else "install_components"))
+
+
 class LoginPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -338,9 +440,10 @@ class LoginPanel(QWidget):
         layout.setSpacing(12)
         self.hint = QLabel(tr("login_hint"))
         self.hint.setWordWrap(True)
-        self.retry_button = QPushButton(tr("retry"))
+        self.authorize_button = QPushButton(tr("authorize"))
+        self.authorize_button.setObjectName("primary")
         row = QHBoxLayout()
-        row.addWidget(self.retry_button)
+        row.addWidget(self.authorize_button)
         row.addStretch(1)
         layout.addWidget(self.hint)
         layout.addLayout(row)
@@ -348,7 +451,7 @@ class LoginPanel(QWidget):
 
     def retranslate(self) -> None:
         self.hint.setText(tr("login_hint"))
-        self.retry_button.setText(tr("retry"))
+        self.authorize_button.setText(tr("authorize"))
 
 
 class LanguagePanel(QWidget):
@@ -798,8 +901,10 @@ class MainWindow(QMainWindow):
         stored = load_settings(self._settings_path)
         set_language(stored.ui_language)
         self._theme = normalize_theme(stored.theme)
-        self._status_state = "logging_in"
-        self._status_phrase: tuple = ("key", "checking_connection", {})
+        self._status_state = "checking"
+        self._status_phrase: tuple = ("key", "checking_components", {})
+        self._install_attempted = False
+        self._dependency_report: dict[str, bool] | None = None
         self._has_profile = False
         self._profile_user_id: str | None = None
         self._profile_display_name: str | None = None
@@ -844,9 +949,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(self.steps_layout)
         self._rebuild_steps()
 
-        self.connection = QLabel(tr("state_logging_in"))
+        self.connection = QLabel(tr("state_checking"))
         self.connection.setObjectName("connection")
-        self.detail = QLabel(tr("checking_connection"))
+        self.detail = QLabel(tr("checking_components"))
         self.detail.setObjectName("detail")
         self.detail.setWordWrap(True)
         self.profile_label = QLabel("")
@@ -863,11 +968,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.install_progress)
 
         self.stack = QStackedWidget()
+        self.deps_panel = DependencyPanel()
         self.login_panel = LoginPanel()
         self.language_panel = LanguagePanel()
         self.words_panel = WordListPanel()
         self.build_panel = BuildPanel()
         self.save_panel = SavePanel()
+        self.stack.addWidget(self.deps_panel)
         self.stack.addWidget(self.login_panel)
         self.stack.addWidget(self.language_panel)
         self.stack.addWidget(self.words_panel)
@@ -875,7 +982,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.save_panel)
         layout.addWidget(self.stack, 1)
 
-        self.login_panel.retry_button.clicked.connect(lambda _checked=False: self._retry_connect())
+        self.deps_panel.install_button.clicked.connect(lambda _checked=False: self._install_missing())
+        self.login_panel.authorize_button.clicked.connect(lambda _checked=False: self._authorize())
         self.language_panel.confirm_button.clicked.connect(lambda _checked=False: self._confirm_language())
         self.words_panel.next_button.clicked.connect(lambda _checked=False: self._start_build())
         self.words_panel.refresh_button.clicked.connect(lambda _checked=False: self._refresh())
@@ -889,20 +997,21 @@ class MainWindow(QMainWindow):
         self.worker.load_failed.connect(self._on_load_failed)
         self.worker.profile_ready.connect(self._on_profile)
         self.worker.connect_failed.connect(self._on_connect_failed)
+        self.worker.dependencies_checked.connect(self._on_dependencies)
+        self.worker.dependency_failed.connect(self._on_dependency_failed)
         self.worker.build_progress.connect(self._on_build_progress)
         self.worker.build_ready.connect(self._on_build_ready)
         self.worker.build_failed.connect(self._on_build_failed)
-        self._show_step(_STEP_LOGIN)
+        self._show_step(_STEP_DEPS)
         self._apply_phrase(self._status_state, self._status_phrase)
         self.words_panel.set_busy(True)
-        self.login_panel.retry_button.setEnabled(False)
         self._apply_saved_folder()
         self._apply_theme(self._theme, persist=False)
         self.worker.start()
-        self.worker.connect_account()
+        self.worker.check_dependencies()
 
     def _step_titles(self) -> list[str]:
-        titles = [tr("step_login")]
+        titles = [tr("step_components"), tr("step_login")]
         if self._chooser_needed:
             titles.append(tr("language_word"))
         titles.extend([tr("step_words"), tr("step_build"), tr("step_save")])
@@ -912,7 +1021,7 @@ class MainWindow(QMainWindow):
         if self._chooser_needed:
             return stack_index
         if stack_index <= _STEP_LOGIN:
-            return 0
+            return stack_index
         return stack_index - 1
 
     def _rebuild_steps(self) -> None:
@@ -955,7 +1064,9 @@ class MainWindow(QMainWindow):
         self.detail.setText(detail)
         self.install_progress.setVisible(self._status_visible() and state == "installing")
         if state == "failed" and self.stack.currentIndex() == _STEP_LOGIN:
-            self.login_panel.retry_button.setEnabled(True)
+            self.login_panel.authorize_button.setEnabled(True)
+        if state == "failed" and self.stack.currentIndex() == _STEP_DEPS:
+            self.deps_panel.install_button.setEnabled(True)
 
     def _repolish(self, widget: QWidget) -> None:
         style = widget.style()
@@ -969,16 +1080,56 @@ class MainWindow(QMainWindow):
         if not self.worker.isRunning() and not self.worker.stopping():
             self.worker.start()
 
-    def _retry_connect(self) -> None:
-        self.login_panel.retry_button.setEnabled(False)
+    def _install_missing(self) -> None:
+        self._install_attempted = True
+        self.deps_panel.install_button.setEnabled(False)
+        try:
+            self._show_step(_STEP_DEPS)
+            self._apply_phrase("installing", ("key", "installing_missing", {}))
+            self._ensure_worker()
+            self.worker.install_dependencies()
+        except Exception as exc:
+            self.deps_panel.install_button.setEnabled(True)
+            self.deps_panel.install_button.setText(tr("repair_components"))
+            self._apply_phrase("failed", phrase_for_exception(exc))
+
+    def _authorize(self) -> None:
+        self.login_panel.authorize_button.setEnabled(False)
         try:
             self._show_step(_STEP_LOGIN)
-            self._apply_phrase("logging_in", ("key", "checking_connection", {}))
+            self._apply_phrase("logging_in", ("key", "opening_browser", {}))
             self._ensure_worker()
-            self.worker.retry_connection()
+            self.worker.connect_account()
         except Exception as exc:
-            self.login_panel.retry_button.setEnabled(True)
+            self.login_panel.authorize_button.setEnabled(True)
             self._apply_phrase("failed", phrase_for_exception(exc))
+
+    def _on_dependencies(self, report: object) -> None:
+        items = dict(report) if isinstance(report, dict) else {}
+        self._dependency_report = items
+        ready = dependencies_ready(items)
+        self.deps_panel.show_report(items, repair=self._install_attempted)
+        if ready:
+            self._install_attempted = False
+            if self.stack.currentIndex() == _STEP_DEPS:
+                self._show_step(_STEP_LOGIN)
+                self._apply_phrase("ready", ("key", "authorize_waiting", {}))
+            return
+        self._show_step(_STEP_DEPS)
+        detail_key = "deps_repair" if self._install_attempted else "deps_missing"
+        self._apply_phrase("failed", ("key", detail_key, {}))
+
+    def _on_dependency_failed(self, message: str) -> None:
+        phrase = _pop(self.worker._dependency_failed_queue)
+        if phrase is None:
+            phrase = ("plain", message)
+        self._install_attempted = True
+        self.deps_panel.install_button.setVisible(True)
+        self.deps_panel.install_button.setEnabled(True)
+        self.deps_panel.install_button.setText(tr("repair_components"))
+        self.deps_panel._repair = True
+        self._show_step(_STEP_DEPS)
+        self._apply_phrase("failed", phrase)
 
     def _refresh(self) -> None:
         subject = self._selected_alias
@@ -1011,7 +1162,7 @@ class MainWindow(QMainWindow):
         action, _subject = language_plan(self._languages)
         self._chooser_needed = action == "choose"
         self._rebuild_steps()
-        self.login_panel.retry_button.setEnabled(True)
+        self.login_panel.authorize_button.setEnabled(True)
         alias = vocabulary_alias(self._languages)
         if alias:
             self._open_vocabulary(alias)
@@ -1060,7 +1211,7 @@ class MainWindow(QMainWindow):
 
     def _on_connect_failed_phrase(self, phrase: tuple) -> None:
         self.words_panel.set_busy(False)
-        self.login_panel.retry_button.setEnabled(True)
+        self.login_panel.authorize_button.setEnabled(True)
         self._show_step(_STEP_LOGIN)
         self._apply_phrase("failed", phrase)
 
@@ -1198,6 +1349,9 @@ class MainWindow(QMainWindow):
         self.settings_button.setText(tr("settings"))
         self._fill_theme_combo()
         self._rebuild_steps()
+        self.deps_panel.retranslate()
+        if self._dependency_report is not None:
+            self.deps_panel.show_report(self._dependency_report, repair=self._install_attempted)
         self.login_panel.retranslate()
         self.language_panel.retranslate()
         self.words_panel.retranslate()
