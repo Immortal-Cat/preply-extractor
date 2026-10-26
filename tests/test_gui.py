@@ -628,6 +628,81 @@ class DefaultBrowserTests(unittest.TestCase):
         self.assertEqual(browser_family("FirefoxURL-308046B0AF4A39CB"), "firefox")
         self.assertEqual(browser_family("ChromeHTML"), "chrome")
         self.assertEqual(browser_family("MSEdgeHTM"), "edge")
+        self.assertEqual(browser_family("OperaStable"), "opera")
+        self.assertEqual(browser_family("OperaGXStable"), "opera-gx")
+
+    def test_opera_stable_uses_its_own_cookie_database(self) -> None:
+        from preply_extractor.browser_login import (
+            BrowserCookieError,
+            chromium_cookie_database,
+            chromium_user_data_dir,
+            load_default_browser_preply_cookies,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            appdata = Path(tmp)
+            root = appdata / "Opera Software" / "Opera Stable"
+            (root / "Network").mkdir(parents=True)
+            database = root / "Network" / "Cookies"
+            database.write_bytes(b"")
+            (root / "Local State").write_text("{}", encoding="utf-8")
+            seen: dict[str, object] = {}
+
+            def fake_read(path, key):
+                seen["database"] = path
+                seen["key"] = key
+                return [{"domain": ".preply.com", "name": "sessionid", "value": "present", "path": "/"}]
+
+            def fake_key(user_data):
+                seen["user_data"] = user_data
+                return b"key"
+
+            legacy_root = appdata / "Opera Software" / "legacy"
+            legacy_root.mkdir(parents=True)
+            legacy = legacy_root / "Cookies"
+            legacy.write_bytes(b"")
+            gx = appdata / "Opera Software" / "Opera GX Stable"
+            gx.mkdir()
+
+            with (
+                patch.dict(os.environ, {"APPDATA": str(appdata)}),
+                patch("preply_extractor.browser_login.read_chromium_cookies", fake_read),
+                patch("preply_extractor.browser_login.chromium_master_key", fake_key),
+                patch("preply_extractor.browser_login._copy_sqlite", side_effect=AssertionError("cookie copy")),
+                patch(
+                    "preply_extractor.preply_api.BrowserSession.__enter__",
+                    side_effect=AssertionError("playwright"),
+                ),
+            ):
+                try:
+                    cookies = load_default_browser_preply_cookies("OperaStable")
+                except BrowserCookieError as exc:
+                    self.fail(str(exc))
+                self.assertEqual(chromium_user_data_dir("opera"), root)
+                self.assertEqual(chromium_user_data_dir("opera-gx"), gx)
+            self.assertEqual(seen["database"], database)
+            self.assertEqual(seen["user_data"], root)
+            self.assertEqual(seen["key"], b"key")
+            self.assertNotIn(".preply-profile", str(seen["database"]).lower())
+            self.assertEqual(chromium_cookie_database(legacy_root, "opera"), legacy)
+            self.assertEqual([cookie["name"] for cookie in cookies], ["sessionid"])
+            self.assertTrue(all(str(cookie["domain"]).endswith("preply.com") for cookie in cookies))
+            self.assertFalse(any("google" in str(cookie["domain"]) for cookie in cookies))
+
+    def test_chrome_cookie_database_stays_in_the_profile(self) -> None:
+        from preply_extractor.browser_login import chromium_cookie_database, chromium_user_data_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp)
+            root = local / "Google" / "Chrome" / "User Data"
+            profile = root / "Default" / "Network"
+            profile.mkdir(parents=True)
+            database = profile / "Cookies"
+            database.write_bytes(b"")
+            (root / "Local State").write_text('{"profile": {"last_used": "Default"}}', encoding="utf-8")
+            with patch.dict(os.environ, {"LOCALAPPDATA": str(local)}):
+                self.assertEqual(chromium_user_data_dir("chrome"), root)
+                self.assertEqual(chromium_cookie_database(root, "chrome"), database)
 
     def test_open_uses_the_https_handler_and_not_a_custom_profile(self) -> None:
         from preply_extractor.browser_login import PREPLY_AUTH_URL, open_in_default_browser

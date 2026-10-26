@@ -1,10 +1,10 @@
 """Open Preply in the Windows default browser and reuse that browser's own cookies.
 
 Authorize uses ShellExecute (``os.startfile``) on an https URL. The registered
-browser handles the URL. Firefox, Chrome, and Edge ask the process that is
-already running to open a tab, and they load their normal profile when they
-are not running. This module does not start Playwright and does not pass a
-separate ``--user-data-dir``.
+browser handles the URL. Firefox, Chrome, Edge, and Opera ask the process
+that is already running to open a tab, and they load their normal profile
+when they are not running. This module does not start Playwright and does
+not pass a separate ``--user-data-dir``.
 
 Cookies are copied out of the locked database and limited to preply.com.
 Cookie values are never written to logs or error text.
@@ -83,6 +83,10 @@ def browser_family(progid: str) -> str:
     text = progid.strip().lower()
     if "firefox" in text:
         return "firefox"
+    if "opera" in text:
+        if "gx" in text:
+            return "opera-gx"
+        return "opera"
     if "edg" in text:
         return "edge"
     if "brave" in text:
@@ -99,7 +103,10 @@ def load_default_browser_preply_cookies(progid: str | None = None) -> list[dict]
         cookies = read_firefox_cookies(firefox_cookie_database())
     else:
         root = chromium_user_data_dir(family)
-        cookies = read_chromium_cookies(chromium_cookie_database(root), chromium_master_key(root))
+        cookies = read_chromium_cookies(
+            chromium_cookie_database(root, family),
+            chromium_master_key(root),
+        )
     return require_preply_session(cookies)
 
 
@@ -127,29 +134,52 @@ def firefox_cookie_database() -> Path:
 
 
 def chromium_user_data_dir(family: str) -> Path:
-    local = Path(os.environ.get("LOCALAPPDATA", ""))
-    relative = {
-        "chrome": Path("Google") / "Chrome" / "User Data",
-        "edge": Path("Microsoft") / "Edge" / "User Data",
-        "brave": Path("BraveSoftware") / "Brave-Browser" / "User Data",
-    }.get(family)
+    if family in {"opera", "opera-gx"}:
+        base = Path(os.environ.get("APPDATA", ""))
+        relative = {
+            "opera": Path("Opera Software") / "Opera Stable",
+            "opera-gx": Path("Opera Software") / "Opera GX Stable",
+        }[family]
+    else:
+        base = Path(os.environ.get("LOCALAPPDATA", ""))
+        relative = {
+            "chrome": Path("Google") / "Chrome" / "User Data",
+            "edge": Path("Microsoft") / "Edge" / "User Data",
+            "brave": Path("BraveSoftware") / "Brave-Browser" / "User Data",
+        }.get(family)
     if relative is None:
         raise BrowserCookieError(f"No cookie location is known for {family}.")
-    root = local / relative
+    root = base / relative
     if not root.is_dir():
         raise BrowserCookieError(f"The {family} profile directory was not found.")
     return root
 
 
-def chromium_cookie_database(user_data: Path) -> Path:
+def chromium_cookie_database(user_data: Path, family: str | None = None) -> Path:
+    """Cookie sqlite for a Chromium user-data directory.
+
+    Opera keeps ``Network/Cookies`` or ``Cookies`` directly in its profile
+    directory. Chrome, Edge, and Brave keep them inside the last-used profile.
+    """
+    if family in {"opera", "opera-gx"}:
+        direct = _cookie_file(user_data)
+        if direct is not None:
+            return direct
     profile = _chromium_profile_name(user_data)
-    network = user_data / profile / "Network" / "Cookies"
-    legacy = user_data / profile / "Cookies"
+    nested = _cookie_file(user_data / profile)
+    if nested is not None:
+        return nested
+    raise BrowserCookieError("The browser cookie database was not found.")
+
+
+def _cookie_file(directory: Path) -> Path | None:
+    network = directory / "Network" / "Cookies"
+    legacy = directory / "Cookies"
     if network.is_file():
         return network
     if legacy.is_file():
         return legacy
-    raise BrowserCookieError("The browser cookie database was not found.")
+    return None
 
 
 def read_firefox_cookies(database: Path) -> list[dict]:
