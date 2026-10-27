@@ -93,14 +93,18 @@ STRINGS: dict[str, dict[str, str]] = {
         "ru": "Браузер ещё не открыт. Нажмите «Авторизоваться на Preply». Пароль программа не спрашивает.",
         "en": "The browser is not open yet. Click Authorize on Preply. The program does not ask for your password.",
     },
+    "opening_login": {
+        "ru": "Открывается отдельное окно входа…",
+        "en": "Opening a separate sign-in window…",
+    },
     "login_opened": {
-        "ru": "Страница входа открыта в браузере по умолчанию. Войдите в свой аккаунт и нажмите «Я вошёл». Пароль программа не спрашивает.",
-        "en": "The sign-in page is open in your default browser. Sign in to your account and click I've signed in. The program does not ask for your password.",
+        "ru": "Отдельное окно открыто. Войдите в свой аккаунт Preply в нём и нажмите «Я вошёл». Первый раз Google подтверждается в этом окне, дальше оно помнит вход. Пароль программа не спрашивает.",
+        "en": "A separate window is open. Sign in to your Preply account there and click I've signed in. The first time, sign in to Google in this window; later runs reuse it. The program does not ask for your password.",
     },
     "signed_in": {"ru": "Я вошёл", "en": "I've signed in"},
     "login_not_finished": {
-        "ru": "В браузере по умолчанию ещё нет входа на preply.com. Завершите вход и нажмите «Я вошёл».",
-        "en": "The default browser does not have a preply.com sign-in yet. Finish signing in and click I've signed in.",
+        "ru": "В отдельном окне ещё нет входа на preply.com. Завершите вход и нажмите «Я вошёл».",
+        "en": "The separate window does not have a preply.com sign-in yet. Finish signing in and click I've signed in.",
     },
     "session_cookie_unreadable": {
         "ru": "Не удалось прочитать cookie входа на preply.com. Войдите снова и нажмите «Я вошёл».",
@@ -158,8 +162,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "downloading_audio": {"ru": "Скачивание произношения…", "en": "Downloading pronunciation…"},
     "writing_deck": {"ru": "Запись файла колоды…", "en": "Writing the deck file…"},
     "login_hint": {
-        "ru": "Компоненты уже проверены. Кнопка откроет Preply в вашем обычном браузере, новой вкладкой. Пароль программа не спрашивает и не сохраняет. Когда войдёте, нажмите «Я вошёл».",
-        "en": "The components are already checked. The button opens Preply in your usual browser, as a new tab. The program does not ask for your password or store it. After you sign in, click I've signed in.",
+        "ru": "Компоненты уже проверены. Кнопка откроет отдельное окно со своим профилем, не вкладку в Opera. Первый раз войдите в Google в этом окне — потом оно запомнит вход. Основное окно Opera не закрывается. Пароль программа не спрашивает. Когда войдёте, нажмите «Я вошёл».",
+        "en": "The components are already checked. The button opens a separate window with this program's own profile, not a tab in Opera. The first time, sign in to Google in that window; later runs reuse it. Your main Opera window stays open. The program does not ask for your password. After you sign in, click I've signed in.",
     },
     "retry": {"ru": "Повторить", "en": "Retry"},
     "choose_language_title": {"ru": "Выберите язык", "en": "Choose a language"},

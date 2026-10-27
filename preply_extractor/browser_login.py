@@ -1,14 +1,13 @@
-"""Open Preply in the Windows default browser and reuse that browser's own cookies.
+"""Sign in through a separate browser profile, then reuse those cookies.
 
-Authorize uses ShellExecute (``os.startfile``) on an https URL. The registered
-browser handles the URL. Firefox, Chrome, Edge, and Opera ask the process
-that is already running to open a tab, and they load their normal profile
-when they are not running. This module does not start Playwright and does
-not pass a separate ``--user-data-dir``.
+``os.startfile`` on an https URL is ShellExecute. The registered browser,
+including Opera, opens that URL as a tab in the process that is already
+running. The desktop window does not use that path. It opens Playwright's
+persistent context on this program's own profile directory and reads cookies
+from that context. It does not open Opera's cookie database.
 
-Cookies are copied with a shared read while the browser keeps the database
-open, then limited to preply.com. Cookie values are never written to logs
-or error text.
+``open_in_default_browser`` remains for the ShellExecute behavior itself.
+Cookie values are never written to logs or error text.
 """
 
 from __future__ import annotations
@@ -71,6 +70,114 @@ class BrowserCookieSession:
 
     def close(self) -> None:
         self._inner.close()
+
+
+class SeparateProfileWindow:
+    """Playwright window on this program's profile. The main Opera window is not touched."""
+
+    def __init__(self, user_data_dir: Path | str, channel: str | None) -> None:
+        resolved = Path(user_data_dir).resolve()
+        if "opera software" in str(resolved).lower():
+            raise BrowserCookieError("The sign-in window cannot use the main Opera profile.")
+        self.user_data_dir = str(resolved)
+        self.channel = channel or None
+        self._playwright = None
+        self._context = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._context is not None
+
+    def open(self, url: str) -> None:
+        """Launch the profile window, or navigate again when it is already open."""
+        if not url.startswith("https://"):
+            raise BrowserCookieError("Only an https Preply address can be opened.")
+        if self._context is not None:
+            page = self._context.pages[0] if self._context.pages else self._context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            return
+        Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        launch_kwargs = {
+            "headless": False,
+            "viewport": {"width": 1280, "height": 900},
+        }
+        if self.channel:
+            launch_kwargs["channel"] = self.channel
+        try:
+            context = playwright.chromium.launch_persistent_context(self.user_data_dir, **launch_kwargs)
+        except Exception:
+            playwright.stop()
+            raise
+        self._playwright = playwright
+        self._context = context
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+    def read_preply_cookies(self) -> list[dict]:
+        """preply.com cookies from this window. Does not open a cookie database."""
+        if self._context is None:
+            raise NoPreplySession("no preply.com session cookie")
+        return cookies_from_browser_api(list(self._context.cookies()))
+
+    def close(self) -> None:
+        context = self._context
+        playwright = self._playwright
+        self._context = None
+        self._playwright = None
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+def cookies_from_browser_api(cookies: list[dict]) -> list[dict]:
+    """Normalize cookies from ``context.cookies()``.
+
+    Chromium's on-disk host-hash prefix is removed when it is present.
+    Values that cannot be sent as latin-1 are left for the session check to
+    reject. This function does not open Opera's cookie file.
+    """
+    prepared: list[dict] = []
+    for cookie in cookies:
+        domain = str(cookie.get("domain") or "")
+        if not _is_preply_host(domain):
+            continue
+        value = _api_cookie_text(cookie.get("value"), domain)
+        prepared.append(
+            {
+                "domain": domain,
+                "name": str(cookie.get("name") or ""),
+                "value": value if value is not None else str(cookie.get("value") or ""),
+                "path": str(cookie.get("path") or "/"),
+            }
+        )
+    return require_preply_session(prepared)
+
+
+def _api_cookie_text(value: object, host: str) -> str | None:
+    if isinstance(value, bytes):
+        raw = value
+    else:
+        text = str(value or "")
+        if "\ufffd" in text:
+            return None
+        try:
+            raw = text.encode("latin-1")
+        except UnicodeEncodeError:
+            return None
+    text = _cookie_text(_strip_host_bound_prefix(raw, host))
+    if "\ufffd" in text:
+        return None
+    return text
 
 
 def open_in_default_browser(url: str, opener=None) -> None:

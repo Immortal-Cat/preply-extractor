@@ -43,8 +43,7 @@ from preply_extractor.browser_login import (
     PREPLY_AUTH_URL,
     BrowserCookieSession,
     NoPreplySession,
-    load_default_browser_preply_cookies,
-    open_in_default_browser,
+    SeparateProfileWindow,
 )
 from preply_extractor.cli import DEFAULT_DECK
 from preply_extractor.deck_job import collect_audio
@@ -66,6 +65,7 @@ from preply_extractor.preply_api import (
     SessionCancelled,
     fetch_learner_profile,
     fetch_vocabulary,
+    preferred_browser_channel,
 )
 from preply_extractor.settings_dialog import SettingsDialog
 from preply_extractor.themes import apply_theme, normalize_theme
@@ -81,6 +81,11 @@ from preply_extractor.ui_text import (
 from preply_extractor.words import VocabWord
 
 PROFILE_DIR = Path(".preply-profile")
+
+
+def program_profile_directory() -> Path:
+    """This program's profile, next to the project. Not Opera's or Chrome's user data."""
+    return (Path(__file__).resolve().parent.parent / PROFILE_DIR).resolve()
 PAGE_SIZE = 20
 PAGE_DELAY = 0.25
 UI_LANGUAGE = "en"
@@ -124,6 +129,7 @@ class ExportWorker(QThread):
     build_progress = Signal(int, int, str)
     build_ready = Signal(str, object)
     build_failed = Signal(str)
+    login_window_opened = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -135,6 +141,7 @@ class ExportWorker(QThread):
         self._build_failed_queue: queue.Queue = queue.Queue()
         self._progress_queue: queue.Queue = queue.Queue()
         self._session = None
+        self._login: SeparateProfileWindow | None = None
         self._stop = False
 
     def stopping(self) -> bool:
@@ -160,8 +167,12 @@ class ExportWorker(QThread):
         """Queue installation of whatever the report marks missing. Does not open a browser."""
         self._commands.put(("install", None))
 
+    def open_login_window(self) -> None:
+        """Queue the separate profile window. Does not use the default browser."""
+        self._commands.put(("open-login", None))
+
     def use_browser_cookies(self) -> None:
-        """Read the default browser's Preply cookies and continue. Does not launch a browser."""
+        """Read cookies from the separate sign-in window. Does not open Opera's cookie file."""
         self._commands.put(("cookies", None))
 
     def retry_connection(self) -> None:
@@ -187,12 +198,15 @@ class ExportWorker(QThread):
             command, payload = self._commands.get()
             if command == "quit" or self._stop:
                 self._close_session()
+                self._close_login_window()
                 return
             try:
                 if command == "check":
                     self._check_dependencies()
                 elif command == "install":
                     self._install_dependencies()
+                elif command == "open-login":
+                    self._open_login()
                 elif command in {"cookies", "connect", "retry"}:
                     if command == "retry":
                         self._close_session()
@@ -201,6 +215,7 @@ class ExportWorker(QThread):
                     self._load(str(payload))
                 elif command == "release":
                     self._close_session()
+                    self._close_login_window()
                 elif command == "build":
                     self._build(list(payload))
             except Exception as exc:
@@ -287,17 +302,40 @@ class ExportWorker(QThread):
         if not dependencies_ready(fresh):
             self._emit_dependency_failure(("key", "deps_still_missing", {}))
 
+    def _open_login(self) -> None:
+        if self._stop:
+            return
+        try:
+            if self._login is None:
+                self._login = SeparateProfileWindow(
+                    program_profile_directory(),
+                    preferred_browser_channel(),
+                )
+            self._login.open(PREPLY_AUTH_URL)
+        except Exception as exc:
+            if self._login is not None and not self._login.is_open:
+                self._close_login_window()
+            if not self._stop:
+                self._emit_failure(self.connect_failed, self._connect_failed_queue, phrase_for_exception(exc))
+            return
+        if not self._stop:
+            self.login_window_opened.emit()
+
     def _connect(self) -> None:
         if self._stop:
             return
         try:
-            cookies = load_default_browser_preply_cookies()
+            login = self._login
+            if login is None or not login.is_open:
+                raise NoPreplySession("no preply.com session cookie")
+            cookies = login.read_preply_cookies()
             if self._stop:
                 return
             self._close_session()
             self._session = BrowserCookieSession(cookies, UI_LANGUAGE)
             self._emit_status("connected", ("key", "reading_profile", {}))
             profile = fetch_learner_profile(self._session.post_json, endpoint=self._session.endpoint)
+            self._close_login_window()
             if self._stop:
                 return
             self.profile_ready.emit(profile)
@@ -346,7 +384,7 @@ class ExportWorker(QThread):
                 self._emit_failure(self.load_failed, self._load_failed_queue, phrase_for_exception(exc))
 
     def _ensure_session(self) -> None:
-        """Keep using the cookie session. Authorization never opens Playwright."""
+        """Keep the requests client that was built from the separate window."""
         if self._session is not None:
             return
         raise RuntimeError("Нет подключения к Preply.")
@@ -384,15 +422,23 @@ class ExportWorker(QThread):
                 self._emit_failure(self.build_failed, self._build_failed_queue, phrase_for_exception(exc))
 
     def _close_session(self) -> None:
-        """Close this app's session. A Playwright context is closed; Opera is not."""
+        """Close the requests client. The sign-in window and Opera stay open."""
         session = self._session
         self._session = None
         if session is None:
             return
-        context = getattr(session, "context", None)
-        if context is not None and hasattr(context, "close"):
-            context.close()
         session.close()
+
+    def _close_login_window(self) -> None:
+        """Close only the profile window this program opened."""
+        window = self._login
+        self._login = None
+        if window is None:
+            return
+        try:
+            window.close()
+        except Exception:
+            return
 
 
 class DependencyPanel(QWidget):
@@ -1029,6 +1075,7 @@ class MainWindow(QMainWindow):
         self.worker.load_failed.connect(self._on_load_failed)
         self.worker.profile_ready.connect(self._on_profile)
         self.worker.connect_failed.connect(self._on_connect_failed)
+        self.worker.login_window_opened.connect(self._on_login_window_opened)
         self.worker.dependencies_checked.connect(self._on_dependencies)
         self.worker.dependency_failed.connect(self._on_dependency_failed)
         self.worker.build_progress.connect(self._on_build_progress)
@@ -1130,14 +1177,18 @@ class MainWindow(QMainWindow):
     def _authorize(self) -> None:
         self.login_panel.authorize_button.setEnabled(False)
         try:
-            open_in_default_browser(PREPLY_AUTH_URL)
+            self._show_step(_STEP_LOGIN)
+            self._apply_phrase("logging_in", ("key", "opening_login", {}))
+            self._ensure_worker()
+            self.worker.open_login_window()
         except Exception as exc:
             self.login_panel.authorize_button.setEnabled(True)
             if self.login_panel.continue_button.isVisible():
                 self.login_panel.continue_button.setEnabled(True)
             self._show_step(_STEP_LOGIN)
             self._apply_phrase("failed", phrase_for_exception(exc))
-            return
+
+    def _on_login_window_opened(self) -> None:
         self.login_panel.authorize_button.setEnabled(True)
         self.login_panel.continue_button.setVisible(True)
         self.login_panel.continue_button.setEnabled(True)

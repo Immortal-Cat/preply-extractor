@@ -66,6 +66,28 @@ def _words() -> list[VocabWord]:
     ]
 
 
+class _FakeLoginWindow:
+    def __init__(self, missing_session: bool = False) -> None:
+        self.is_open = True
+        self.closed = False
+        self.missing_session = missing_session
+
+    def read_preply_cookies(self) -> list[dict]:
+        if self.missing_session:
+            from preply_extractor.browser_login import NoPreplySession
+
+            raise NoPreplySession("no preply.com session cookie")
+        return [{"name": "sessionid", "domain": ".preply.com", "path": "/", "value": "present"}]
+
+    def close(self) -> None:
+        self.closed = True
+        self.is_open = False
+
+
+def _open_login_window(missing_session: bool = False) -> _FakeLoginWindow:
+    return _FakeLoginWindow(missing_session)
+
+
 class SavePathTests(unittest.TestCase):
     def test_adds_apkg_and_refuses_empty_name(self) -> None:
         folder = Path("C:/Users/example/Documents")
@@ -407,7 +429,11 @@ class BrowserRetryTests(unittest.TestCase):
         ready: list[object] = []
         worker.profile_ready.connect(ready.append)
 
-        def session_from_cookies(_cookies, _language):
+        login = _open_login_window()
+        worker._login = login
+
+        def session_from_cookies(cookies, _language):
+            self.assertEqual([item["name"] for item in cookies], ["sessionid"])
             session = type("Session", (), {})()
             session.endpoint = "/graphql/v2"
             session.post_json = lambda *_a, **_k: (200, "{}")
@@ -416,7 +442,9 @@ class BrowserRetryTests(unittest.TestCase):
 
         with (
             patch("preply_extractor.gui.subprocess.run") as run,
-            patch("preply_extractor.gui.load_default_browser_preply_cookies", return_value=[{"name": "sessionid", "domain": ".preply.com", "path": "/", "value": "present"}]) as loaded,
+            patch("preply_extractor.browser_login.load_default_browser_preply_cookies", side_effect=AssertionError("opera cookies")) as loaded,
+            patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera cookies")),
+            patch("os.startfile", side_effect=AssertionError("tab")),
             patch("preply_extractor.gui.BrowserCookieSession", side_effect=session_from_cookies),
             patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
             patch("preply_extractor.gui.fetch_learner_profile", return_value=object()),
@@ -426,9 +454,11 @@ class BrowserRetryTests(unittest.TestCase):
             self.assertEqual(worker._commands.get_nowait()[0], "cookies")
             worker._connect()
         run.assert_not_called()
-        loaded.assert_called_once()
+        loaded.assert_not_called()
         launched.assert_not_called()
         self.assertEqual(len(ready), 1)
+        self.assertTrue(login.closed)
+        self.assertIsNone(worker._login)
         vocab.assert_not_called()
 
     def test_retry_skips_install_when_browser_exists_and_logs_in(self) -> None:
@@ -448,9 +478,12 @@ class BrowserRetryTests(unittest.TestCase):
             order.append("profile")
             return object()
 
+        worker._login = _open_login_window()
         with (
             patch("preply_extractor.gui.subprocess.run") as run,
-            patch("preply_extractor.gui.load_default_browser_preply_cookies", return_value=[{"name": "sessionid", "domain": ".preply.com", "path": "/", "value": "present"}]),
+            patch("preply_extractor.browser_login.load_default_browser_preply_cookies", side_effect=AssertionError("opera cookies")),
+            patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera cookies")),
+            patch("os.startfile", side_effect=AssertionError("tab")),
             patch("preply_extractor.gui.BrowserCookieSession", side_effect=session_from_cookies),
             patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
             patch("preply_extractor.gui.fetch_learner_profile", side_effect=load_profile),
@@ -554,8 +587,8 @@ class StartupFlowTests(unittest.TestCase):
             saved.write_bytes(b"saved-deck")
             with (
                 patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
-                patch("preply_extractor.gui.open_in_default_browser") as opened,
-                patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
+                patch("os.startfile") as opened,
+                patch("preply_extractor.gui.SeparateProfileWindow.open") as launched,
             ):
                 window = MainWindow(settings_file=path)
                 try:
@@ -592,15 +625,12 @@ class StartupFlowTests(unittest.TestCase):
 
     def test_startup_check_does_not_open_a_browser_until_authorize(self) -> None:
         _app()
-        from preply_extractor.browser_login import PREPLY_AUTH_URL
-
-        opened: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
             with (
                 patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
-                patch("preply_extractor.gui.open_in_default_browser", side_effect=opened.append),
-                patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
+                patch("os.startfile") as opened,
+                patch("preply_extractor.gui.SeparateProfileWindow.open") as launched,
             ):
                 window = MainWindow(settings_file=path)
                 window.show()
@@ -609,16 +639,27 @@ class StartupFlowTests(unittest.TestCase):
                     self.assertEqual(window.worker._commands.get_nowait()[0], "check")
                     self.assertFalse(hasattr(window, "theme_combo"))
                     launched.assert_not_called()
-                    self.assertEqual(opened, [])
+                    opened.assert_not_called()
+                    from preply_extractor.ui_text import tr
+
+                    hint = window.login_panel.hint.text().lower()
+                    english = tr("login_hint", language="en").lower()
+                    self.assertNotIn("новой вкладкой", hint)
+                    self.assertNotIn("new tab", english)
+                    self.assertNotIn("default browser", english)
+                    self.assertIn("google", hint)
+                    self.assertIn("google", english)
                     window.login_panel.authorize_button.click()
-                    self.assertEqual(opened, [PREPLY_AUTH_URL])
-                    self.assertTrue(opened[0].startswith("https://"))
-                    self.assertFalse(window.login_panel.continue_button.isHidden())
-                    self.assertTrue(window.worker._commands.empty())
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "open-login")
+                    self.assertTrue(window.login_panel.continue_button.isHidden())
+                    opened.assert_not_called()
                     launched.assert_not_called()
+                    window._on_login_window_opened()
+                    self.assertFalse(window.login_panel.continue_button.isHidden())
                     window.login_panel.continue_button.click()
                     self.assertEqual(window.worker._commands.get_nowait()[0], "cookies")
                     launched.assert_not_called()
+                    opened.assert_not_called()
                 finally:
                     window.close()
 
@@ -664,6 +705,115 @@ class StartupFlowTests(unittest.TestCase):
                     launched.assert_not_called()
                 finally:
                     window.close()
+
+
+class SeparateWindowTests(unittest.TestCase):
+    def test_authorize_starts_a_persistent_context_without_startfile(self) -> None:
+        _app()
+        import hashlib
+
+        from preply_extractor.browser_login import PREPLY_AUTH_URL, BrowserCookieError, SeparateProfileWindow
+
+        started: dict[str, object] = {}
+
+        class Page:
+            def goto(self, url, **_kwargs) -> None:
+                started["url"] = url
+
+        class Context:
+            pages: list = []
+
+            def new_page(self) -> Page:
+                return Page()
+
+            def close(self) -> None:
+                started["closed"] = True
+
+            def cookies(self) -> list[dict]:
+                started["cookies_read"] = True
+                host = ".preply.com"
+                raw = hashlib.sha256(host.encode("utf-8")).digest() + b"ok"
+                return [
+                    {"name": "sessionid", "value": raw.decode("latin-1"), "domain": host, "path": "/"},
+                    {"name": "sid", "value": "other-site", "domain": ".google.com", "path": "/"},
+                ]
+
+        class Bundle:
+            def __init__(self) -> None:
+                self.chromium = self
+
+            def launch_persistent_context(self, user_data_dir, **kwargs):
+                started["dir"] = str(user_data_dir)
+                started["kwargs"] = dict(kwargs)
+                return Context()
+
+            def stop(self) -> None:
+                started["stopped"] = True
+
+        class Manager:
+            def start(self) -> Bundle:
+                return Bundle()
+
+        worker = ExportWorker()
+        opened: list[bool] = []
+        worker.login_window_opened.connect(lambda: opened.append(True))
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / ".preply-profile"
+            with (
+                patch("os.startfile", side_effect=AssertionError("tab")),
+                patch("preply_extractor.gui.program_profile_directory", return_value=profile),
+                patch("preply_extractor.gui.preferred_browser_channel", return_value="chrome"),
+                patch("playwright.sync_api.sync_playwright", return_value=Manager()),
+                patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
+                patch("preply_extractor.browser_login._copy_bytes_shared", side_effect=AssertionError("opera")),
+            ):
+                worker._open_login()
+                chrome_kwargs = dict(started["kwargs"])
+                cookies = worker._login.read_preply_cookies()
+                plain = SeparateProfileWindow(profile, None)
+                plain.open(PREPLY_AUTH_URL)
+                bundled_kwargs = dict(started["kwargs"])
+            self.assertEqual(opened, [True])
+            self.assertTrue(str(started["dir"]).endswith(".preply-profile"))
+            self.assertNotIn("opera software", str(started["dir"]).lower())
+            self.assertEqual(chrome_kwargs["channel"], "chrome")
+            self.assertIs(chrome_kwargs["headless"], False)
+            self.assertNotIn("channel", bundled_kwargs)
+            self.assertEqual(started["url"], PREPLY_AUTH_URL)
+            self.assertTrue(started["cookies_read"])
+            self.assertEqual([item["name"] for item in cookies], ["sessionid"])
+            self.assertEqual(cookies[0]["value"], "ok")
+            self.assertNotIn("\ufffd", cookies[0]["value"])
+            self.assertTrue(profile.is_dir())
+        appdata = os.environ.get("APPDATA", "")
+        with self.assertRaises(BrowserCookieError):
+            SeparateProfileWindow(Path(appdata) / "Opera Software" / "Opera Stable", "chrome")
+
+    def test_profile_failure_leaves_the_sign_in_window_open(self) -> None:
+        _app()
+        worker = ExportWorker()
+        failed: list[str] = []
+        worker.connect_failed.connect(failed.append)
+        login = _open_login_window()
+        worker._login = login
+
+        def session_from_cookies(_cookies, _language):
+            session = type("Session", (), {})()
+            session.endpoint = "/graphql/v2"
+            session.post_json = lambda *_a, **_k: (200, "{}")
+            session.close = lambda: None
+            return session
+
+        with (
+            patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
+            patch("os.startfile", side_effect=AssertionError("tab")),
+            patch("preply_extractor.gui.BrowserCookieSession", side_effect=session_from_cookies),
+            patch("preply_extractor.gui.fetch_learner_profile", side_effect=RuntimeError("profile")),
+        ):
+            worker._connect()
+        self.assertFalse(login.closed)
+        self.assertIs(worker._login, login)
+        self.assertEqual(len(failed), 1)
 
 
 class DefaultBrowserTests(unittest.TestCase):
@@ -1158,22 +1308,24 @@ class DefaultBrowserTests(unittest.TestCase):
         self.assertIn("Bad request token", message)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz012345", message)
 
-    def test_missing_session_cookie_does_not_open_playwright(self) -> None:
+    def test_missing_session_cookie_does_not_open_the_opera_file(self) -> None:
         _app()
         from preply_extractor.browser_login import NoPreplySession
 
         worker = ExportWorker()
         failed: list[str] = []
         worker.connect_failed.connect(failed.append)
+        login = _open_login_window(missing_session=True)
+        worker._login = login
         with (
-            patch(
-                "preply_extractor.gui.load_default_browser_preply_cookies",
-                side_effect=NoPreplySession("no preply.com session cookie"),
-            ),
+            patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera cookies")),
+            patch("preply_extractor.browser_login._copy_bytes_shared", side_effect=AssertionError("opera cookies")),
+            patch("os.startfile", side_effect=AssertionError("tab")),
             patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
         ):
             worker._connect()
         launched.assert_not_called()
+        self.assertFalse(login.closed)
         self.assertEqual(len(failed), 1)
         self.assertIn("preply.com", failed[0])
         self.assertIn("Я вошёл", failed[0])
