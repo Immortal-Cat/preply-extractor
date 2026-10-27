@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -302,7 +303,7 @@ def _pick_endpoint(
             raise AuthRequired(
                 "Preply did not accept the session. Log in to your own account and run the export again."
             )
-        last_error = f"HTTP {status}"
+        last_error = http_error_hint(status, body)
     raise PreplyError(last_error)
 
 
@@ -409,7 +410,7 @@ def fetch_learner_profile(post_json: PostJson, endpoint: str | None = None) -> L
             raise AuthRequired(
                 "Preply did not accept the session. Log in to your own account and run the export again."
             )
-        last_error = f"HTTP {status}"
+        last_error = http_error_hint(status, body)
     raise PreplyError(f"Не удалось прочитать профиль. Список слов не загружен. {last_error}")
 
 
@@ -437,6 +438,48 @@ def _payload(category: str, page_size: int, after: str | None, language_code: st
 def _looks_like_html(body: str) -> bool:
     stripped = body.lstrip().lower()
     return stripped.startswith("<!doctype") or stripped.startswith("<html")
+
+
+def http_error_hint(status: int, body: str) -> str:
+    """Short status text. Long tokens in the body are not shown."""
+    hint = _response_hint(body)
+    hint = _redact_secrets(hint)
+    hint = re.sub(r"\s+", " ", hint).strip()
+    if len(hint) > 180:
+        hint = hint[:180].rstrip() + "..."
+    if hint:
+        return f"HTTP {status}: {hint}"
+    return f"HTTP {status}: empty response"
+
+
+def _response_hint(body: str) -> str:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            messages = [
+                str(item.get("message"))
+                for item in errors
+                if isinstance(item, dict) and item.get("message")
+            ]
+            if messages:
+                return "; ".join(messages)
+        for key in ("detail", "message", "error"):
+            if payload.get(key):
+                return str(payload[key])
+    return body
+
+
+def _redact_secrets(text: str) -> str:
+    text = re.sub(
+        r"(?i)(sessionid|csrftoken|csrf|token|authorization|cookie)\s*[=:]\s*\S+",
+        r"\1=[redacted]",
+        text,
+    )
+    return re.sub(r"[A-Za-z0-9_\-]{24,}", "[redacted]", text)
 
 
 def cookie_header_value(value: object) -> str | None:
@@ -513,7 +556,7 @@ class RequestsSession:
             value = cookie_header_value(cookie.get("value"))
             domain = cookie_header_value(cookie.get("domain")) or ".preply.com"
             path = cookie_header_value(cookie.get("path")) or "/"
-            if not name or value is None:
+            if not name or not value:
                 continue
             session.cookies.set(name, value, domain=domain, path=path)
         token = session.cookies.get("csrftoken") or session.cookies.get("csrf_token")

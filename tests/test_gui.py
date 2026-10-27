@@ -1032,6 +1032,87 @@ class DefaultBrowserTests(unittest.TestCase):
         self.assertNotIn("Traceback", shown)
         self.assertIn("preply.com", shown)
 
+    def test_host_hash_prefix_is_not_sent_as_the_cookie(self) -> None:
+        import hashlib
+        import sqlite3
+
+        from preply_extractor.browser_login import _strip_host_bound_prefix, read_chromium_cookies
+
+        host = "preply.com"
+        prefix = hashlib.sha256(host.encode("utf-8")).digest()
+        self.assertEqual(_strip_host_bound_prefix(prefix + b"session-ok", host), b"session-ok")
+        self.assertEqual(_strip_host_bound_prefix(b"plain-value", host), b"plain-value")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "Cookies"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO cookies VALUES (?, ?, ?, ?, ?)",
+                (host, "sessionid", "", b"encrypted", "/"),
+            )
+            connection.commit()
+            connection.close()
+            with patch(
+                "preply_extractor.browser_login._decrypt_chromium_bytes",
+                return_value=prefix + b"session-ok",
+            ):
+                cookies = read_chromium_cookies(database, b"k" * 32)
+        self.assertEqual([cookie["name"] for cookie in cookies], ["sessionid"])
+        self.assertEqual(cookies[0]["value"], "session-ok")
+        self.assertEqual(len(cookies[0]["value"]), len("session-ok"))
+
+    def test_profile_request_sends_site_headers_and_explains_400(self) -> None:
+        import requests
+
+        from preply_extractor.preply_api import PreplyError, RequestsSession, fetch_learner_profile
+
+        session = RequestsSession(
+            [
+                {"domain": "preply.com", "name": "sessionid", "value": "session-test", "path": "/"},
+                {"domain": "preply.com", "name": "csrftoken", "value": "csrf-test", "path": "/"},
+                {"domain": "preply.com", "name": "empty", "value": "", "path": "/"},
+            ],
+            "en",
+        )
+        client = session._client()
+        self.assertEqual(client.headers.get("Origin"), "https://preply.com")
+        self.assertEqual(client.headers.get("Referer"), "https://preply.com/en/practice/vocab-bank")
+        self.assertEqual(client.headers.get("Content-Type"), "application/json")
+        self.assertEqual(client.headers.get("x-csrftoken"), "csrf-test")
+        self.assertNotIn("empty", {cookie.name for cookie in client.cookies})
+
+        class Adapter(requests.adapters.BaseAdapter):
+            def send(self, request, **kwargs):
+                seen["origin"] = request.headers.get("Origin", "")
+                seen["referer"] = request.headers.get("Referer", "")
+                seen["csrf"] = request.headers.get("x-csrftoken", "")
+                response = requests.Response()
+                response.status_code = 400
+                response._content = (
+                    b'{"errors":[{"message":"Bad request token abcdefghijklmnopqrstuvwxyz012345"}]}'
+                )
+                response.url = request.url
+                response.headers["Content-Type"] = "application/json"
+                return response
+
+            def close(self) -> None:
+                return None
+
+        seen: dict[str, str] = {}
+        client.mount("https://", Adapter())
+        with self.assertRaises(PreplyError) as caught:
+            fetch_learner_profile(session.post_json)
+        message = str(caught.exception)
+        self.assertEqual(seen["origin"], "https://preply.com")
+        self.assertIn("vocab-bank", seen["referer"])
+        self.assertEqual(seen["csrf"], "csrf-test")
+        self.assertIn("HTTP 400", message)
+        self.assertIn("Bad request token", message)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz012345", message)
+
     def test_missing_session_cookie_does_not_open_playwright(self) -> None:
         _app()
         from preply_extractor.browser_login import NoPreplySession

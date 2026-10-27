@@ -14,6 +14,7 @@ or error text.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -273,7 +274,9 @@ def read_chromium_cookies(database: Path, key: bytes | None) -> list[dict]:
             continue
         value = str(plain or "")
         if not value and encrypted:
-            value = _decrypt_chromium_value(bytes(encrypted), key)
+            raw = _decrypt_chromium_bytes(bytes(encrypted), key)
+            raw = _strip_host_bound_prefix(raw, str(host or ""))
+            value = _cookie_text(raw)
         cookies.append(
             {
                 "domain": str(host or ".preply.com"),
@@ -635,6 +638,10 @@ def _restart_manager_holders(path: Path) -> str:
 
 
 def _decrypt_chromium_value(encrypted: bytes, key: bytes | None) -> str:
+    return _cookie_text(_decrypt_chromium_bytes(encrypted, key))
+
+
+def _decrypt_chromium_bytes(encrypted: bytes, key: bytes | None) -> bytes:
     if encrypted.startswith(b"v20"):
         raise BrowserCookieError("This browser's cookie encryption could not be read.")
     try:
@@ -652,7 +659,21 @@ def _decrypt_chromium_value(encrypted: bytes, key: bytes | None) -> str:
         raise
     except Exception as exc:
         raise BrowserCookieError("This browser's cookie encryption could not be read.") from exc
-    return _cookie_text(plain)
+    return plain
+
+
+def _strip_host_bound_prefix(raw: bytes, host: str) -> bytes:
+    """Drop Chromium's SHA-256(host) prefix when the decrypted cookie has one.
+
+    Current Chrome and Opera store that 32-byte hash in front of the value.
+    Sending it makes the Cookie header binary, and Preply answers HTTP 400.
+    """
+    if len(raw) < 32 or not host:
+        return raw
+    digest = hashlib.sha256(host.encode("utf-8")).digest()
+    if raw[:32] == digest:
+        return raw[32:]
+    return raw
 
 
 def _cookie_text(raw: bytes) -> str:
