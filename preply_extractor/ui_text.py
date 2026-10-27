@@ -20,6 +20,10 @@ _LANGUAGE = "ru"
 STRINGS: dict[str, dict[str, str]] = {
     "window_title": {"ru": "Словарь Preply в Anki", "en": "Preply vocabulary to Anki"},
     "settings": {"ru": "Настройки", "en": "Settings"},
+    "window_minimize": {"ru": "Свернуть", "en": "Minimize"},
+    "window_maximize": {"ru": "Развернуть", "en": "Maximize"},
+    "window_restore": {"ru": "Восстановить", "en": "Restore"},
+    "window_close": {"ru": "Закрыть", "en": "Close"},
     "interface_language": {"ru": "Язык интерфейса", "en": "Interface language"},
     "language_name_ru": {"ru": "Русский", "en": "Russian"},
     "language_name_en": {"ru": "Английский", "en": "English"},

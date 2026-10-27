@@ -1840,5 +1840,68 @@ class ChromeProfileTests(unittest.TestCase):
         self.assertNotIn("User Data", str(seen["dir"]))
 
 
+class FramelessWindowTests(unittest.TestCase):
+    def test_header_drags_and_close_uses_the_quit_path(self) -> None:
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None):
+                window = MainWindow(settings_file=path)
+                window.show()
+                try:
+                    self.assertTrue(bool(window.windowFlags() & Qt.WindowType.FramelessWindowHint))
+                    self.assertEqual(window.windowTitle(), "Словарь Preply в Anki")
+                    self.assertTrue(window.minimize_button.isVisible())
+                    self.assertTrue(window.maximize_button.isVisible())
+                    self.assertTrue(window.close_button.isVisible())
+
+                    window.move(80, 60)
+                    local = QPointF(12, 10)
+                    start = QPointF(200, 150)
+                    press = QMouseEvent(
+                        QEvent.Type.MouseButtonPress,
+                        local,
+                        start,
+                        Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier,
+                    )
+                    window.title_bar.mousePressEvent(press)
+                    moved = QMouseEvent(
+                        QEvent.Type.MouseMove,
+                        local + QPointF(40, 15),
+                        start + QPointF(40, 15),
+                        Qt.MouseButton.NoButton,
+                        Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier,
+                    )
+                    window.title_bar.mouseMoveEvent(moved)
+                    self.assertEqual(window.pos().x(), 120)
+                    self.assertEqual(window.pos().y(), 75)
+
+                    window.maximize_button.click()
+                    self.assertTrue(window.isMaximized())
+                    self.assertEqual(window.maximize_button.toolTip(), "Восстановить")
+                    self.assertEqual(window.maximize_button.text(), "❐")
+                    window.maximize_button.click()
+                    self.assertFalse(window.isMaximized())
+                    self.assertEqual(window.maximize_button.text(), "□")
+
+                    closed: list[object] = []
+
+                    def fake_close(self, event) -> None:
+                        closed.append(self)
+                        event.accept()
+
+                    with patch.object(MainWindow, "closeEvent", fake_close):
+                        window.close_button.click()
+                    self.assertEqual(closed, [window])
+                finally:
+                    window.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

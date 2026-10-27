@@ -204,6 +204,18 @@ QPushButton#primary:disabled {
     background: __BORDER__;
     color: __MUTED__;
 }
+QPushButton#windowButton, QPushButton#closeButton {
+    background: transparent;
+    color: __TEXT__;
+    border: none;
+    border-radius: 6px;
+    padding: 0;
+    min-height: 28px;
+    min-width: 36px;
+    font-size: 14px;
+}
+QPushButton#windowButton:hover { background: __SURFACE__; }
+QPushButton#closeButton:hover { background: #be123c; color: #ffffff; }
 QRadioButton {
     color: __TEXT__;
     background: transparent;

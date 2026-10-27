@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -1031,6 +1031,37 @@ class SavePanel(QWidget):
         self._write_copy(destination)
 
 
+class _TitleBar(QWidget):
+    """Empty header area that drags a frameless window. Buttons handle their own clicks."""
+
+    def __init__(self, window: QMainWindow) -> None:
+        super().__init__(window)
+        self._window = window
+        self._offset: QPoint | None = None
+        self.setObjectName("titleBar")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and not self._window.isMaximized():
+            self._offset = event.globalPosition().toPoint() - self._window.frameGeometry().topLeft()
+        else:
+            self._offset = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._window.move(event.globalPosition().toPoint() - self._offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._window._toggle_maximized()
+        super().mouseDoubleClickEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings_file: Path | None = None) -> None:
         super().__init__()
@@ -1045,6 +1076,7 @@ class MainWindow(QMainWindow):
         self._has_profile = False
         self._profile_user_id: str | None = None
         self._profile_display_name: str | None = None
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setWindowTitle(tr("window_title"))
         self.resize(920, 700)
         self.setMinimumSize(760, 560)
@@ -1061,16 +1093,28 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
-        header = QHBoxLayout()
+        self.title_bar = _TitleBar(self)
+        header = QHBoxLayout(self.title_bar)
         header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
         self.heading = QLabel(tr("window_title"))
         self.heading.setObjectName("title")
+        self.heading.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.settings_button = QPushButton(tr("settings"))
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.clicked.connect(self._open_settings)
+        self.minimize_button = self._chrome_button("windowButton", "–", tr("window_minimize"))
+        self.maximize_button = self._chrome_button("windowButton", "□", tr("window_maximize"))
+        self.close_button = self._chrome_button("closeButton", "✕", tr("window_close"))
+        self.minimize_button.clicked.connect(self.showMinimized)
+        self.maximize_button.clicked.connect(self._toggle_maximized)
+        self.close_button.clicked.connect(self.close)
         header.addWidget(self.heading, 1)
         header.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addLayout(header)
+        header.addWidget(self.minimize_button)
+        header.addWidget(self.maximize_button)
+        header.addWidget(self.close_button)
+        layout.addWidget(self.title_bar)
 
         self.step_labels = []
         self.steps_layout = QHBoxLayout()
@@ -1495,6 +1539,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(tr("window_title"))
         self.heading.setText(tr("window_title"))
         self.settings_button.setText(tr("settings"))
+        self.minimize_button.setToolTip(tr("window_minimize"))
+        self.close_button.setToolTip(tr("window_close"))
+        self._sync_maximize_button()
         self._rebuild_steps()
         self.deps_panel.retranslate()
         if self._dependency_report is not None:
@@ -1507,6 +1554,36 @@ class MainWindow(QMainWindow):
         self._render_profile()
         self._set_connection(self._status_state, phrase_text(self._status_phrase))
         self._show_step(current)
+
+    def _chrome_button(self, object_name: str, glyph: str, tip: str) -> QPushButton:
+        button = QPushButton(glyph)
+        button.setObjectName(object_name)
+        button.setToolTip(tip)
+        button.setFixedSize(36, 32)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setAutoDefault(False)
+        return button
+
+    def _toggle_maximized(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._sync_maximize_button()
+
+    def _sync_maximize_button(self) -> None:
+        if self.isMaximized():
+            self.maximize_button.setText("❐")
+            self.maximize_button.setToolTip(tr("window_restore"))
+        else:
+            self.maximize_button.setText("□")
+            self.maximize_button.setToolTip(tr("window_maximize"))
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "maximize_button"):
+            self._sync_maximize_button()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._discard_temp()
