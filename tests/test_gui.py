@@ -789,6 +789,158 @@ class SeparateWindowTests(unittest.TestCase):
         with self.assertRaises(BrowserCookieError):
             SeparateProfileWindow(Path(appdata) / "Opera Software" / "Opera Stable", "chrome")
 
+    def test_closed_context_is_replaced_on_the_next_authorize(self) -> None:
+        _app()
+        from preply_extractor.browser_login import PREPLY_AUTH_URL, SeparateProfileWindow
+
+        class TargetClosedError(Exception):
+            pass
+
+        launches: list[str] = []
+        visited: list[str] = []
+
+        class DeadPage:
+            def is_closed(self) -> bool:
+                return True
+
+            def goto(self, _url: str, **_kwargs) -> None:
+                raise TargetClosedError("browser-context page context for browser has been closed")
+
+        class DeadContext:
+            def __init__(self) -> None:
+                self.pages = [DeadPage()]
+                self.closed = False
+
+            def new_page(self) -> None:
+                raise TargetClosedError("browser-context page context for browser has been closed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        class LivePage:
+            def is_closed(self) -> bool:
+                return False
+
+            def goto(self, url: str, **_kwargs) -> None:
+                visited.append(url)
+
+        class LiveContext:
+            def __init__(self) -> None:
+                self.pages: list[LivePage] = []
+
+            def new_page(self) -> LivePage:
+                page = LivePage()
+                self.pages.append(page)
+                return page
+
+            def close(self) -> None:
+                return None
+
+        class Bundle:
+            def __init__(self) -> None:
+                self.chromium = self
+
+            def launch_persistent_context(self, user_data_dir, **_kwargs):
+                launches.append(str(user_data_dir))
+                return LiveContext()
+
+            def stop(self) -> None:
+                return None
+
+        class Manager:
+            def start(self) -> Bundle:
+                return Bundle()
+
+        dead = DeadContext()
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / ".preply-profile"
+            window = SeparateProfileWindow(profile, "chrome")
+            window._context = dead
+            window._playwright = Bundle()
+            worker = ExportWorker()
+            worker._login = window
+            opened: list[bool] = []
+            worker.login_window_opened.connect(lambda: opened.append(True))
+            with (
+                patch("os.startfile", side_effect=AssertionError("tab")),
+                patch("playwright.sync_api.sync_playwright", return_value=Manager()),
+                patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
+            ):
+                worker._open_login()
+                worker._open_login()
+            self.assertEqual(opened, [True, True])
+            self.assertEqual(len(launches), 1)
+            self.assertTrue(launches[0].endswith(".preply-profile"))
+            self.assertNotIn("opera software", launches[0].lower())
+            self.assertEqual(visited, [PREPLY_AUTH_URL, PREPLY_AUTH_URL])
+            self.assertTrue(dead.closed)
+            self.assertIs(worker._login, window)
+
+    def test_closed_context_during_sign_in_shows_a_short_message(self) -> None:
+        _app()
+
+        class TargetClosedError(Exception):
+            pass
+
+        class ClosedWindow:
+            is_open = True
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def read_preply_cookies(self) -> list[dict]:
+                raise TargetClosedError("browser-context page context for browser has been closed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        worker = ExportWorker()
+        failed: list[str] = []
+        worker.connect_failed.connect(failed.append)
+        login = ClosedWindow()
+        worker._login = login
+        with (
+            patch("os.startfile", side_effect=AssertionError("tab")),
+            patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
+            patch("preply_extractor.browser_login._copy_bytes_shared", side_effect=AssertionError("opera")),
+        ):
+            worker._connect()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("Окно входа закрыто", failed[0])
+        self.assertIn("Авторизоваться", failed[0])
+        self.assertNotIn("has been closed", failed[0].lower())
+        self.assertNotIn("traceback", failed[0].lower())
+        self.assertTrue(login.closed)
+        self.assertIsNone(worker._login)
+
+        worker = ExportWorker()
+        failed.clear()
+        worker.connect_failed.connect(failed.append)
+        login = _open_login_window()
+        worker._login = login
+
+        def session_from_cookies(_cookies, _language):
+            session = type("Session", (), {})()
+            session.endpoint = "/graphql/v2"
+
+            def post_json(*_args, **_kwargs):
+                raise TargetClosedError("has been closed")
+
+            session.post_json = post_json
+            session.close = lambda: None
+            return session
+
+        with (
+            patch("os.startfile", side_effect=AssertionError("tab")),
+            patch("preply_extractor.gui.BrowserCookieSession", side_effect=session_from_cookies),
+        ):
+            worker._connect()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("Окно входа закрыто", failed[0])
+        self.assertNotIn("has been closed", failed[0].lower())
+        self.assertTrue(login.closed)
+        self.assertIsNone(worker._login)
+
     def test_profile_failure_leaves_the_sign_in_window_open(self) -> None:
         _app()
         worker = ExportWorker()

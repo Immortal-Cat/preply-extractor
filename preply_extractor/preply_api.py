@@ -382,6 +382,14 @@ def parse_learner_profile(payload: dict) -> LearnerProfile:
     )
 
 
+def browser_context_closed(exc: BaseException) -> bool:
+    """True when Playwright is talking to a window the user already closed."""
+    if type(exc).__name__ in {"TargetClosedError", "LoginWindowClosed"}:
+        return True
+    text = str(exc).lower()
+    return "has been closed" in text or "target closed" in text
+
+
 def fetch_learner_profile(post_json: PostJson, endpoint: str | None = None) -> LearnerProfile:
     """Load the signed-in learner. A failed call raises; it does not assume english."""
     payload = profile_payload()
@@ -396,6 +404,8 @@ def fetch_learner_profile(post_json: PostJson, endpoint: str | None = None) -> L
         try:
             status, body = post_json(path, payload)
         except Exception as exc:
+            if browser_context_closed(exc):
+                raise
             last_error = str(exc)
             continue
         if status == 404:

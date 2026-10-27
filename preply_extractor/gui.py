@@ -42,8 +42,10 @@ from preply_extractor.audio import AudioFailure
 from preply_extractor.browser_login import (
     PREPLY_AUTH_URL,
     BrowserCookieSession,
+    LoginWindowClosed,
     NoPreplySession,
     SeparateProfileWindow,
+    context_was_closed,
 )
 from preply_extractor.cli import DEFAULT_DECK
 from preply_extractor.deck_job import collect_audio
@@ -313,6 +315,9 @@ class ExportWorker(QThread):
                 )
             self._login.open(PREPLY_AUTH_URL)
         except Exception as exc:
+            if context_was_closed(exc):
+                self._fail_closed_window()
+                return
             if self._login is not None and not self._login.is_open:
                 self._close_login_window()
             if not self._stop:
@@ -326,8 +331,10 @@ class ExportWorker(QThread):
             return
         try:
             login = self._login
-            if login is None or not login.is_open:
+            if login is None:
                 raise NoPreplySession("no preply.com session cookie")
+            if not login.is_open:
+                raise LoginWindowClosed("sign-in window was closed")
             cookies = login.read_preply_cookies()
             if self._stop:
                 return
@@ -345,6 +352,9 @@ class ExportWorker(QThread):
         except SessionCancelled:
             return
         except Exception as exc:
+            if context_was_closed(exc):
+                self._fail_closed_window()
+                return
             self._close_session()
             if not self._stop:
                 self._emit_failure(self.connect_failed, self._connect_failed_queue, phrase_for_exception(exc))
@@ -439,6 +449,13 @@ class ExportWorker(QThread):
             window.close()
         except Exception:
             return
+
+    def _fail_closed_window(self) -> None:
+        """The user closed the sign-in window. Keep Opera open and ask for a new one."""
+        self._close_session()
+        self._close_login_window()
+        if not self._stop:
+            self._emit_failure(self.connect_failed, self._connect_failed_queue, ("key", "login_window_closed", {}))
 
 
 class DependencyPanel(QWidget):

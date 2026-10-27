@@ -23,7 +23,12 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from preply_extractor.preply_api import GRAPHQL_PATHS, RequestsSession, cookie_header_value
+from preply_extractor.preply_api import (
+    GRAPHQL_PATHS,
+    RequestsSession,
+    browser_context_closed,
+    cookie_header_value,
+)
 
 PREPLY_AUTH_URL = "https://preply.com/en/practice/vocab-bank"
 _SESSION_COOKIE = "sessionid"
@@ -49,6 +54,10 @@ class NoPreplySession(RuntimeError):
 
 class BrowserCookieError(RuntimeError):
     """The default browser's cookie store could not be read."""
+
+
+class LoginWindowClosed(RuntimeError):
+    """The separate sign-in window was closed before sign-in finished."""
 
 
 class UnreadableSessionCookie(BrowserCookieError):
@@ -86,16 +95,71 @@ class SeparateProfileWindow:
 
     @property
     def is_open(self) -> bool:
-        return self._context is not None
+        try:
+            return self._context_is_usable()
+        except Exception as exc:
+            if context_was_closed(exc):
+                return False
+            raise
 
     def open(self, url: str) -> None:
-        """Launch the profile window, or navigate again when it is already open."""
+        """Navigate the current window, or launch a new one when that window is gone."""
         if not url.startswith("https://"):
             raise BrowserCookieError("Only an https Preply address can be opened.")
         if self._context is not None:
-            page = self._context.pages[0] if self._context.pages else self._context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            return
+            try:
+                if self._context_is_usable():
+                    self._goto(url)
+                    return
+            except Exception as exc:
+                if not context_was_closed(exc):
+                    raise
+            self._discard_closed()
+        self._launch(url)
+
+    def read_preply_cookies(self) -> list[dict]:
+        """preply.com cookies from this window. Does not open a cookie database."""
+        if not self.is_open:
+            self._discard_closed()
+            raise LoginWindowClosed("sign-in window was closed")
+        try:
+            raw = list(self._context.cookies())
+        except Exception as exc:
+            if context_was_closed(exc):
+                self._discard_closed()
+                raise LoginWindowClosed("sign-in window was closed") from exc
+            raise
+        return cookies_from_browser_api(raw)
+
+    def close(self) -> None:
+        self._discard_closed()
+
+    def _context_is_usable(self) -> bool:
+        """True when this context can still open a page. A closed window is not usable."""
+        context = self._context
+        if context is None:
+            return False
+        for page in context.pages:
+            checker = getattr(page, "is_closed", None)
+            if callable(checker) and checker():
+                continue
+            return True
+        return True
+
+    def _goto(self, url: str) -> None:
+        context = self._context
+        page = None
+        for candidate in context.pages:
+            checker = getattr(candidate, "is_closed", None)
+            if callable(checker) and checker():
+                continue
+            page = candidate
+            break
+        if page is None:
+            page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+    def _launch(self, url: str) -> None:
         Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
         from playwright.sync_api import sync_playwright
 
@@ -113,16 +177,14 @@ class SeparateProfileWindow:
             raise
         self._playwright = playwright
         self._context = context
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        try:
+            self._goto(url)
+        except Exception:
+            self._discard_closed()
+            raise
 
-    def read_preply_cookies(self) -> list[dict]:
-        """preply.com cookies from this window. Does not open a cookie database."""
-        if self._context is None:
-            raise NoPreplySession("no preply.com session cookie")
-        return cookies_from_browser_api(list(self._context.cookies()))
-
-    def close(self) -> None:
+    def _discard_closed(self) -> None:
+        """Forget a context the user already closed. Opera is not touched."""
         context = self._context
         playwright = self._playwright
         self._context = None
@@ -137,6 +199,11 @@ class SeparateProfileWindow:
                 playwright.stop()
             except Exception:
                 pass
+
+
+def context_was_closed(exc: BaseException) -> bool:
+    """Playwright reports a window the user closed with TargetClosedError."""
+    return isinstance(exc, LoginWindowClosed) or browser_context_closed(exc)
 
 
 def cookies_from_browser_api(cookies: list[dict]) -> list[dict]:

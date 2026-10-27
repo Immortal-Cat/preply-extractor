@@ -106,6 +106,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "ru": "В отдельном окне ещё нет входа на preply.com. Завершите вход и нажмите «Я вошёл».",
         "en": "The separate window does not have a preply.com sign-in yet. Finish signing in and click I've signed in.",
     },
+    "login_window_closed": {
+        "ru": "Окно входа закрыто. Нажмите «Авторизоваться на Preply» ещё раз.",
+        "en": "The sign-in window was closed. Click Authorize on Preply again.",
+    },
     "session_cookie_unreadable": {
         "ru": "Не удалось прочитать cookie входа на preply.com. Войдите снова и нажмите «Я вошёл».",
         "en": "The preply.com sign-in cookie could not be read. Sign in again and click I've signed in.",
@@ -323,6 +327,8 @@ def phrase_for_exception(exc: BaseException) -> tuple:
     """A value ``phrase_text`` can render again after the interface language changes."""
     text = str(exc).strip()
     lowered = text.lower()
+    if type(exc).__name__ in {"LoginWindowClosed", "TargetClosedError"} or "has been closed" in lowered or "target closed" in lowered:
+        return ("key", "login_window_closed", {})
     if (
         isinstance(exc, BrowserInstallError)
         or is_missing_chromium_error(text)
