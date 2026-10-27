@@ -773,8 +773,12 @@ class DefaultBrowserTests(unittest.TestCase):
                     )
                 return real_open(file, *args, **kwargs)
 
+            def no_restart_manager():
+                raise AssertionError("RmShutdown")
+
             with (
                 patch.object(browser_login, "_kernel32", lambda: kernel),
+                patch.object(browser_login, "_rstrtmgr", no_restart_manager),
                 patch("builtins.open", locked_open),
             ):
                 copy = browser_login._copy_sqlite(source)
@@ -792,7 +796,7 @@ class DefaultBrowserTests(unittest.TestCase):
             self.assertEqual(browser_login._FILE_SHARE_ALL, 0x1 | 0x2 | 0x4)
             self.assertTrue(all(call["disposition"] == browser_login._OPEN_EXISTING for call in kernel.calls))
 
-    def test_sharing_violation_is_retried_then_reported(self) -> None:
+    def test_sharing_violation_is_retried_then_names_the_holder(self) -> None:
         import ctypes
 
         from preply_extractor import browser_login
@@ -801,27 +805,72 @@ class DefaultBrowserTests(unittest.TestCase):
         class Denied:
             def __init__(self) -> None:
                 self.calls = 0
+                self.flags: list[int] = []
 
-            def CreateFileW(self, *_args):
+            def CreateFileW(self, _name, _access, _share, _security, _disposition, flags, _template):
                 self.calls += 1
+                self.flags.append(int(flags))
                 ctypes.set_last_error(32)
                 return ctypes.c_void_p(-1).value
 
             def CloseHandle(self, _handle):
                 return 1
 
+        class RestartManager:
+            def __init__(self) -> None:
+                self.called: list[str] = []
+
+            def RmStartSession(self, session, _flags, _key):
+                self.called.append("RmStartSession")
+                session.contents.value = 1
+                return 0
+
+            def RmRegisterResources(self, *_args):
+                self.called.append("RmRegisterResources")
+                return 0
+
+            def RmGetList(self, _session, needed, count, infos, _reason):
+                self.called.append("RmGetList")
+                if infos is None:
+                    needed.contents.value = 1
+                    count.contents.value = 0
+                    return 234
+                count.contents.value = 1
+                infos[0].strAppName = "Opera Internet Browser"
+                return 0
+
+            def RmEndSession(self, _session):
+                self.called.append("RmEndSession")
+                return 0
+
+            def RmShutdown(self, *_args):
+                self.called.append("RmShutdown")
+                raise AssertionError("RmShutdown")
+
         denied = Denied()
+        manager = RestartManager()
         sleeps: list[float] = []
         with (
             patch.object(browser_login, "_kernel32", lambda: denied),
+            patch.object(browser_login, "_rstrtmgr", lambda: manager),
             patch("preply_extractor.browser_login.time.sleep", sleeps.append),
         ):
             with self.assertRaises(BrowserCookieError) as caught:
                 browser_login._copy_bytes_shared(Path("Cookies"), Path("unused"))
-        self.assertIn("being used by another process", str(caught.exception))
-        self.assertNotIn("not one this window can read cookies", str(caught.exception))
-        self.assertEqual(denied.calls, 3)
-        self.assertEqual(sleeps, [0.2, 0.2])
+        message = str(caught.exception)
+        attempts = browser_login._SHARE_ATTEMPTS
+        self.assertIn("being used by another process", message)
+        self.assertIn("Cookies", message)
+        self.assertIn("cookie database", message)
+        self.assertIn("Opera Internet Browser", message)
+        self.assertNotIn("not one this window can read cookies", message)
+        self.assertEqual(denied.calls, attempts * 2)
+        self.assertEqual(denied.flags[:attempts], [browser_login._FILE_ATTRIBUTE_NORMAL] * attempts)
+        backup = browser_login._FILE_ATTRIBUTE_NORMAL | browser_login._FILE_FLAG_BACKUP_SEMANTICS
+        self.assertEqual(denied.flags[attempts:], [backup] * attempts)
+        self.assertEqual(sleeps, [browser_login._RETRY_DELAY_SECONDS] * ((attempts - 1) * 2))
+        self.assertNotIn("RmShutdown", manager.called)
+        self.assertIn("RmEndSession", manager.called)
 
     def test_open_uses_the_https_handler_and_not_a_custom_profile(self) -> None:
         from preply_extractor.browser_login import PREPLY_AUTH_URL, open_in_default_browser

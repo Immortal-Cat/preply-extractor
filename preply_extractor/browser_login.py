@@ -35,7 +35,10 @@ _FILE_SHARE_DELETE = 0x4
 _FILE_SHARE_ALL = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
 _OPEN_EXISTING = 3
 _FILE_ATTRIBUTE_NORMAL = 0x80
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _SHARING_VIOLATION = 32
+_SHARE_ATTEMPTS = 5
+_RETRY_DELAY_SECONDS = 0.2
 _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 _KERNEL32 = None
 
@@ -344,9 +347,10 @@ def _temp_sqlite_uri(path: Path) -> str:
 def _copy_sqlite(source: Path) -> Path:
     """Copy a cookie database that the browser may still have open.
 
-    ``shutil.copy2`` / ``open()`` request exclusive access and raise WinError 32
-    while Opera, Chrome, Edge, Brave, or Firefox holds the file. A shared
-    ``CreateFileW`` read does not.
+    The bytes are read into a temp directory before SQLite opens anything.
+    ``shutil.copy2`` and ``open()`` are not used on the live file: both raise
+    WinError 32 while the browser holds it. Journal, WAL, and SHM siblings
+    use the same shared read. SQLite then opens only the temp copy.
     """
     folder = Path(tempfile.mkdtemp(prefix="preply-cookies-"))
     target = folder / "cookies.sqlite"
@@ -362,30 +366,72 @@ def _copy_sqlite(source: Path) -> Path:
 
 def _copy_bytes_shared(source: Path, target: Path) -> None:
     try:
-        target.write_bytes(_shared_create_read(source))
+        data = _shared_create_read(source)
     except FileNotFoundError:
+        raise
+    except BrowserCookieError:
         raise
     except OSError as exc:
         raise BrowserCookieError(str(exc)) from exc
+    target.write_bytes(data)
 
 
 def _shared_create_read(path: Path) -> bytes:
-    last: OSError | None = None
-    for attempt in range(3):
+    """Read ``path`` while another process has it open.
+
+    Shared ``CreateFileW`` is tried first. ``FILE_FLAG_BACKUP_SEMANTICS`` is
+    tried only after that fails. SeBackupPrivilege is not enabled.
+    """
+    try:
+        return _open_attempts(path, _FILE_ATTRIBUTE_NORMAL)
+    except FileNotFoundError:
+        raise
+    except OSError as shared_error:
+        backup_error: OSError = shared_error
         try:
-            return _read_with_shared_handle(path)
+            return _open_attempts(path, _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_BACKUP_SEMANTICS)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            backup_error = exc
+        holder = _locking_process_names(path)
+        message = str(backup_error).strip() or str(shared_error).strip()
+        role = _cookie_file_role(path.name)
+        if holder:
+            detail = f"{path.name} ({role}) is held by {holder}"
+        else:
+            detail = f"{path.name} ({role})"
+        raise BrowserCookieError(f"{message} {detail}".strip()) from backup_error
+
+
+def _open_attempts(path: Path, flags: int) -> bytes:
+    last: OSError | None = None
+    for attempt in range(_SHARE_ATTEMPTS):
+        try:
+            return _read_with_shared_handle(path, flags)
         except FileNotFoundError:
             raise
         except OSError as exc:
             last = exc
-            if getattr(exc, "winerror", None) != _SHARING_VIOLATION or attempt == 2:
+            if getattr(exc, "winerror", None) != _SHARING_VIOLATION or attempt == _SHARE_ATTEMPTS - 1:
                 raise
-            time.sleep(0.2)
+            time.sleep(_RETRY_DELAY_SECONDS)
     assert last is not None
     raise last
 
 
-def _read_with_shared_handle(path: Path) -> bytes:
+def _cookie_file_role(name: str) -> str:
+    lower = name.lower()
+    if lower.endswith("-journal"):
+        return "cookie journal"
+    if lower.endswith("-wal"):
+        return "cookie wal"
+    if lower.endswith("-shm"):
+        return "cookie shm"
+    return "cookie database"
+
+
+def _read_with_shared_handle(path: Path, flags: int = _FILE_ATTRIBUTE_NORMAL) -> bytes:
     kernel32 = _kernel32()
     handle = kernel32.CreateFileW(
         str(path),
@@ -393,7 +439,7 @@ def _read_with_shared_handle(path: Path) -> bytes:
         _FILE_SHARE_ALL,
         None,
         _OPEN_EXISTING,
-        _FILE_ATTRIBUTE_NORMAL,
+        flags,
         None,
     )
     if _handle_invalid(handle):
@@ -455,6 +501,106 @@ def _kernel32():
         library.CloseHandle.restype = wintypes.BOOL
         _KERNEL32 = library
     return _KERNEL32
+
+
+def _rstrtmgr():
+    return ctypes.WinDLL("rstrtmgr", use_last_error=True)
+
+
+def _locking_process_names(path: Path) -> str:
+    """Name the process that has ``path`` open. Does not close that process."""
+    try:
+        return _restart_manager_holders(path)
+    except Exception:
+        return ""
+
+
+def _restart_manager_holders(path: Path) -> str:
+    """Restart Manager list only. ``RmShutdown`` is never called."""
+    library = _rstrtmgr()
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    class UniqueProcess(ctypes.Structure):
+        _fields_ = [("dwProcessId", wintypes.DWORD), ("ProcessStartTime", FileTime)]
+
+    class ProcessInfo(ctypes.Structure):
+        _fields_ = [
+            ("Process", UniqueProcess),
+            ("strAppName", wintypes.WCHAR * 256),
+            ("strServiceShortName", wintypes.WCHAR * 64),
+            ("ApplicationType", wintypes.DWORD),
+            ("AppStatus", wintypes.ULONG),
+            ("TSSessionId", wintypes.DWORD),
+            ("bRestartable", wintypes.BOOL),
+        ]
+
+    if isinstance(library, ctypes.WinDLL):
+        library.RmStartSession.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, wintypes.LPWSTR]
+        library.RmStartSession.restype = wintypes.DWORD
+        library.RmRegisterResources.argtypes = [
+            wintypes.DWORD,
+            wintypes.UINT,
+            ctypes.POINTER(wintypes.LPCWSTR),
+            wintypes.UINT,
+            ctypes.c_void_p,
+            wintypes.UINT,
+            ctypes.c_void_p,
+        ]
+        library.RmRegisterResources.restype = wintypes.DWORD
+        library.RmGetList.argtypes = [
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.UINT),
+            ctypes.POINTER(wintypes.UINT),
+            ctypes.POINTER(ProcessInfo),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        library.RmGetList.restype = wintypes.DWORD
+        library.RmEndSession.argtypes = [wintypes.DWORD]
+        library.RmEndSession.restype = wintypes.DWORD
+
+    session = wintypes.DWORD(0)
+    key = ctypes.create_unicode_buffer(64)
+    if library.RmStartSession(ctypes.pointer(session), 0, key) != 0:
+        return ""
+    try:
+        files = (wintypes.LPCWSTR * 1)(str(path))
+        if library.RmRegisterResources(session, 1, files, 0, None, 0, None) != 0:
+            return ""
+        needed = wintypes.UINT(0)
+        count = wintypes.UINT(0)
+        reason = wintypes.DWORD(0)
+        status = library.RmGetList(
+            session,
+            ctypes.pointer(needed),
+            ctypes.pointer(count),
+            None,
+            ctypes.pointer(reason),
+        )
+        if needed.value == 0:
+            return ""
+        if status not in (0, 234):
+            return ""
+        infos = (ProcessInfo * needed.value)()
+        count = wintypes.UINT(needed.value)
+        status = library.RmGetList(
+            session,
+            ctypes.pointer(needed),
+            ctypes.pointer(count),
+            infos,
+            ctypes.pointer(reason),
+        )
+        if status != 0:
+            return ""
+        names: list[str] = []
+        for index in range(count.value):
+            text = str(infos[index].strAppName).split("\x00", 1)[0].strip()
+            if text and text not in names:
+                names.append(text)
+        return ", ".join(names)
+    finally:
+        library.RmEndSession(session)
 
 
 def _decrypt_chromium_value(encrypted: bytes, key: bytes | None) -> str:
