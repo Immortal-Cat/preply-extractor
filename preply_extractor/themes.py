@@ -1,7 +1,8 @@
-"""Three dark themes for the desktop wizard.
+"""Dark navy appearance for the desktop wizard, plus an unused light analog.
 
 Styles cover the login screen, language list, word list, settings dialog,
-deck build, and save step. Ids are ``navy``, ``violet``, and ``amber``.
+deck build, and save step. The running window always uses ``navy``.
+``light_navy_stylesheet`` is the same layout with a light background.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 
 from PySide6.QtGui import QColor, QPalette
 
-THEME_IDS: tuple[str, ...] = ("navy", "violet", "amber")
+THEME_IDS: tuple[str, ...] = ("navy",)
 DEFAULT_THEME = "navy"
 
 
@@ -37,7 +38,6 @@ class ThemeColors:
     item_padding: str
 
 
-# Accents are unique on purpose: navy teal, violet purple, amber orange.
 _NAVY = ThemeColors(
     background="#0b1c2e",
     surface="#10263a",
@@ -60,54 +60,31 @@ _NAVY = ThemeColors(
     item_padding="8px 6px",
 )
 
-_VIOLET = ThemeColors(
-    background="#0a0612",
-    surface="#140e20",
-    card="#1b132b",
-    border="#3c2a5c",
-    text="#f4efff",
-    muted="#b3a3cf",
-    accent="#a78bfa",
-    accent_strong="#6d28d9",
-    accent_hover="#7c3aed",
-    on_accent="#faf7ff",
-    on_bright="#1e1033",
-    connected="#ddd6fe",
-    logging_in="#f0abfc",
-    installing="#c4b5fd",
-    failed="#fb7185",
-    done="#d8b4fe",
-    radius="16px",
-    button_padding="5px 12px",
-    item_padding="4px 6px",
-)
-
-_AMBER = ThemeColors(
-    background="#1c1916",
-    surface="#29241f",
-    card="#322c26",
-    border="#5c4a38",
-    text="#faf6f1",
-    muted="#cbbba8",
-    accent="#f59e0b",
-    accent_strong="#d97706",
-    accent_hover="#fbbf24",
-    on_accent="#1c1204",
-    on_bright="#1c1204",
-    connected="#fcd34d",
-    logging_in="#fdba74",
-    installing="#fde68a",
-    failed="#fb7185",
-    done="#fcd34d",
-    radius="6px",
-    button_padding="10px 20px",
-    item_padding="11px 8px",
+# Same turquoise accent and geometry as navy, with a light page and dark text.
+_NAVY_LIGHT = ThemeColors(
+    background="#f3fbfb",
+    surface="#ffffff",
+    card="#ffffff",
+    border="#b7d5d2",
+    text="#102433",
+    muted="#3d5c66",
+    accent="#2dd4bf",
+    accent_strong="#0f766e",
+    accent_hover="#14b8a6",
+    on_accent="#f4fffd",
+    on_bright="#042f2e",
+    connected="#0f766e",
+    logging_in="#a16207",
+    installing="#0e7490",
+    failed="#be123c",
+    done="#047857",
+    radius="10px",
+    button_padding="8px 16px",
+    item_padding="8px 6px",
 )
 
 THEMES: dict[str, ThemeColors] = {
     "navy": _NAVY,
-    "violet": _VIOLET,
-    "amber": _AMBER,
 }
 
 _CSS = """
@@ -227,20 +204,6 @@ QPushButton#primary:disabled {
     background: __BORDER__;
     color: __MUTED__;
 }
-QPushButton#themeChoice {
-    background: __CARD__;
-    color: __TEXT__;
-    border: 1px solid __BORDER__;
-    border-radius: __RADIUS__;
-    padding: __BUTTON_PADDING__;
-    font-weight: 600;
-}
-QPushButton#themeChoice:hover { border-color: __ACCENT__; }
-QPushButton#themeChoice:checked {
-    background: __ACCENT__;
-    color: __ON_BRIGHT__;
-    border: none;
-}
 QRadioButton {
     color: __TEXT__;
     background: transparent;
@@ -307,20 +270,17 @@ QMessageBox QLabel { color: __TEXT__; background: transparent; }
 
 
 def normalize_theme(value: object) -> str:
-    """Return a known theme id. Missing and unknown values become navy."""
-    if isinstance(value, str):
-        key = value.strip().lower()
-        if key in THEMES:
-            return key
+    """Ignore any saved or requested id. The window only uses navy."""
+    del value
     return DEFAULT_THEME
 
 
 def accent_color(theme_id: str) -> str:
-    return THEMES[normalize_theme(theme_id)].accent
+    del theme_id
+    return _NAVY.accent
 
 
-def stylesheet(theme_id: str) -> str:
-    theme = THEMES[normalize_theme(theme_id)]
+def _render(theme: ThemeColors) -> str:
     css = _CSS
     replacements = {
         "__BACKGROUND__": theme.background,
@@ -348,16 +308,26 @@ def stylesheet(theme_id: str) -> str:
     return css
 
 
-def apply_theme(app, theme_id: str) -> str:
-    """Restyle the whole application, including an open settings dialog."""
-    theme_id = normalize_theme(theme_id)
+def stylesheet(theme_id: str = DEFAULT_THEME) -> str:
+    """Dark navy sheet. Any other id is ignored."""
+    del theme_id
+    return _render(_NAVY)
+
+
+def light_navy_stylesheet() -> str:
+    """Light counterpart of navy. Not applied by the running window."""
+    return _render(_NAVY_LIGHT)
+
+
+def apply_theme(app, theme_id: str = DEFAULT_THEME) -> str:
+    """Restyle the whole application with dark navy, ignoring ``theme_id``."""
+    del theme_id
     if app is None:
-        return theme_id
-    theme = THEMES[theme_id]
+        return DEFAULT_THEME
     app.setStyle("Fusion")
-    app.setPalette(_palette(theme))
-    app.setStyleSheet(stylesheet(theme_id))
-    return theme_id
+    app.setPalette(_palette(_NAVY))
+    app.setStyleSheet(stylesheet())
+    return DEFAULT_THEME
 
 
 def _palette(theme: ThemeColors) -> QPalette:

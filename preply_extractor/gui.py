@@ -69,7 +69,7 @@ from preply_extractor.preply_api import (
     fetch_vocabulary,
 )
 from preply_extractor.settings_dialog import SettingsDialog
-from preply_extractor.themes import apply_theme, normalize_theme
+from preply_extractor.themes import DEFAULT_THEME, apply_theme
 from preply_extractor.ui_text import (
     display_word,
     phrase_for_exception,
@@ -1037,7 +1037,7 @@ class MainWindow(QMainWindow):
         self._settings_path = settings_path() if settings_file is None else settings_file
         stored = load_settings(self._settings_path)
         set_language(stored.ui_language)
-        self._theme = normalize_theme(stored.theme)
+        self._theme = DEFAULT_THEME
         self._status_state = "checking"
         self._status_phrase: tuple = ("key", "checking_components", {})
         self._install_attempted = False
@@ -1137,7 +1137,7 @@ class MainWindow(QMainWindow):
         self._apply_phrase(self._status_state, self._status_phrase)
         self.words_panel.set_busy(True)
         self._apply_saved_folder()
-        self._apply_theme(self._theme, persist=False)
+        self._apply_theme()
         self.worker.start()
         self.worker.check_dependencies()
 
@@ -1465,37 +1465,20 @@ class MainWindow(QMainWindow):
     def _apply_saved_folder(self) -> None:
         self.save_panel.apply_default_folder(load_settings(self._settings_path).default_save_dir)
 
-    def _preview_theme(self, theme_id: str) -> None:
-        """Apply a theme immediately and store it. Settings Cancel rolls that store back."""
-        self._apply_theme(theme_id, persist=True)
-
-    def _apply_theme(self, theme_id: str, persist: bool) -> None:
-        self._theme = apply_theme(QApplication.instance(), theme_id)
-        if persist:
-            self._persist_theme(self._theme)
-
-    def _persist_theme(self, theme_id: str) -> None:
-        current = load_settings(self._settings_path)
-        if current.theme == theme_id:
-            return
-        save_settings(
-            AppSettings(current.ui_language, current.default_save_dir, theme_id),
-            self._settings_path,
-        )
+    def _apply_theme(self) -> None:
+        """Always the dark navy sheet, including when settings name another theme."""
+        self._theme = apply_theme(QApplication.instance(), DEFAULT_THEME)
 
     def _open_settings(self) -> None:
         dialog = self._make_settings_dialog(load_settings(self._settings_path))
         dialog.exec()
 
     def _make_settings_dialog(self, current: AppSettings) -> SettingsDialog:
-        initial_theme = normalize_theme(current.theme)
-        dialog = SettingsDialog(self, current, on_theme_preview=self._preview_theme)
+        dialog = SettingsDialog(self, current)
 
         def on_finished(result: int) -> None:
             if result == QDialog.DialogCode.Accepted:
                 self._commit_settings(dialog.chosen())
-            else:
-                self._apply_theme(initial_theme, persist=True)
 
         dialog.finished.connect(on_finished)
         return dialog
@@ -1503,8 +1486,7 @@ class MainWindow(QMainWindow):
     def _commit_settings(self, settings) -> None:
         save_settings(settings, self._settings_path)
         set_language(settings.ui_language)
-        self._theme = normalize_theme(settings.theme)
-        apply_theme(QApplication.instance(), self._theme)
+        self._apply_theme()
         self.retranslate()
         self._apply_saved_folder()
 
@@ -1536,7 +1518,7 @@ class MainWindow(QMainWindow):
 def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication(argv or sys.argv)
     app.setFont(QFont("Segoe UI", 11))
-    apply_theme(app, load_settings().theme)
+    apply_theme(app, DEFAULT_THEME)
     window = MainWindow()
     window.show()
     return app.exec()
