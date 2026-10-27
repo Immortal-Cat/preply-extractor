@@ -704,6 +704,125 @@ class DefaultBrowserTests(unittest.TestCase):
                 self.assertEqual(chromium_user_data_dir("chrome"), root)
                 self.assertEqual(chromium_cookie_database(root, "chrome"), database)
 
+    def test_locked_cookie_file_is_copied_with_shared_read(self) -> None:
+        import ctypes
+        import shutil
+        from ctypes import wintypes
+
+        from preply_extractor import browser_login
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "Cookies"
+            payloads = {
+                str(source): b"db-bytes",
+                str(source) + "-wal": b"wal-bytes",
+                str(source) + "-shm": b"shm-bytes",
+                str(source) + "-journal": b"journal-bytes",
+            }
+            for name, body in payloads.items():
+                Path(name).write_bytes(body)
+
+            class SharedKernel:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+                    self._open: dict[int, bytes] = {}
+                    self._seq = 0
+
+                def CreateFileW(self, name, access, share, security, disposition, flags, template):
+                    self.calls.append(
+                        {
+                            "name": str(name),
+                            "access": int(access),
+                            "share": int(share),
+                            "disposition": int(disposition),
+                        }
+                    )
+                    key = str(name)
+                    if key not in payloads:
+                        ctypes.set_last_error(2)
+                        return ctypes.c_void_p(-1).value
+                    self._seq += 1
+                    self._open[self._seq] = payloads[key]
+                    return self._seq
+
+                def ReadFile(self, handle, buffer, size, read, overlapped):
+                    remaining = self._open.get(int(handle), b"")
+                    chunk = remaining[: int(size)]
+                    self._open[int(handle)] = remaining[len(chunk) :]
+                    if chunk:
+                        ctypes.memmove(buffer, chunk, len(chunk))
+                    ctypes.cast(read, ctypes.POINTER(wintypes.DWORD)).contents.value = len(chunk)
+                    return 1
+
+                def CloseHandle(self, handle):
+                    self._open.pop(int(handle), None)
+                    return 1
+
+            kernel = SharedKernel()
+            real_open = open
+
+            def locked_open(file, *args, **kwargs):
+                name = os.fspath(file)
+                if "preply-cookies-" not in name and Path(name).name.startswith("Cookies"):
+                    raise PermissionError(
+                        13,
+                        "The process cannot access the file because it is being used by another process",
+                        name,
+                        32,
+                    )
+                return real_open(file, *args, **kwargs)
+
+            with (
+                patch.object(browser_login, "_kernel32", lambda: kernel),
+                patch("builtins.open", locked_open),
+            ):
+                copy = browser_login._copy_sqlite(source)
+            try:
+                self.assertEqual(copy.read_bytes(), b"db-bytes")
+                self.assertEqual(Path(str(copy) + "-wal").read_bytes(), b"wal-bytes")
+                self.assertEqual(Path(str(copy) + "-shm").read_bytes(), b"shm-bytes")
+                self.assertEqual(Path(str(copy) + "-journal").read_bytes(), b"journal-bytes")
+            finally:
+                shutil.rmtree(copy.parent, ignore_errors=True)
+            names = [str(call["name"]) for call in kernel.calls]
+            self.assertEqual(names, [str(source), str(source) + "-wal", str(source) + "-shm", str(source) + "-journal"])
+            self.assertTrue(all(call["access"] == browser_login._GENERIC_READ for call in kernel.calls))
+            self.assertTrue(all(call["share"] == browser_login._FILE_SHARE_ALL for call in kernel.calls))
+            self.assertEqual(browser_login._FILE_SHARE_ALL, 0x1 | 0x2 | 0x4)
+            self.assertTrue(all(call["disposition"] == browser_login._OPEN_EXISTING for call in kernel.calls))
+
+    def test_sharing_violation_is_retried_then_reported(self) -> None:
+        import ctypes
+
+        from preply_extractor import browser_login
+        from preply_extractor.browser_login import BrowserCookieError
+
+        class Denied:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def CreateFileW(self, *_args):
+                self.calls += 1
+                ctypes.set_last_error(32)
+                return ctypes.c_void_p(-1).value
+
+            def CloseHandle(self, _handle):
+                return 1
+
+        denied = Denied()
+        sleeps: list[float] = []
+        with (
+            patch.object(browser_login, "_kernel32", lambda: denied),
+            patch("preply_extractor.browser_login.time.sleep", sleeps.append),
+        ):
+            with self.assertRaises(BrowserCookieError) as caught:
+                browser_login._copy_bytes_shared(Path("Cookies"), Path("unused"))
+        self.assertIn("being used by another process", str(caught.exception))
+        self.assertNotIn("not one this window can read cookies", str(caught.exception))
+        self.assertEqual(denied.calls, 3)
+        self.assertEqual(sleeps, [0.2, 0.2])
+
     def test_open_uses_the_https_handler_and_not_a_custom_profile(self) -> None:
         from preply_extractor.browser_login import PREPLY_AUTH_URL, open_in_default_browser
 

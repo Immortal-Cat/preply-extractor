@@ -6,8 +6,9 @@ that is already running to open a tab, and they load their normal profile
 when they are not running. This module does not start Playwright and does
 not pass a separate ``--user-data-dir``.
 
-Cookies are copied out of the locked database and limited to preply.com.
-Cookie values are never written to logs or error text.
+Cookies are copied with a shared read while the browser keeps the database
+open, then limited to preply.com. Cookie values are never written to logs
+or error text.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 from ctypes import wintypes
 from pathlib import Path
 
@@ -26,6 +28,16 @@ from preply_extractor.preply_api import GRAPHQL_PATHS, RequestsSession
 PREPLY_AUTH_URL = "https://preply.com/en/practice/vocab-bank"
 _SESSION_COOKIE = "sessionid"
 _HTTPS_USER_CHOICE = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_READ = 0x1
+_FILE_SHARE_WRITE = 0x2
+_FILE_SHARE_DELETE = 0x4
+_FILE_SHARE_ALL = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x80
+_SHARING_VIOLATION = 32
+_SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+_KERNEL32 = None
 
 
 class NoPreplySession(RuntimeError):
@@ -185,7 +197,7 @@ def _cookie_file(directory: Path) -> Path | None:
 def read_firefox_cookies(database: Path) -> list[dict]:
     copy = _copy_sqlite(database)
     try:
-        connection = sqlite3.connect(f"file:{copy.as_posix()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_temp_sqlite_uri(copy), uri=True)
         try:
             rows = connection.execute(
                 "SELECT host, name, value, path FROM moz_cookies"
@@ -212,7 +224,7 @@ def read_firefox_cookies(database: Path) -> list[dict]:
 def read_chromium_cookies(database: Path, key: bytes | None) -> list[dict]:
     copy = _copy_sqlite(database)
     try:
-        connection = sqlite3.connect(f"file:{copy.as_posix()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_temp_sqlite_uri(copy), uri=True)
         try:
             rows = connection.execute(
                 "SELECT host_key, name, value, encrypted_value, path FROM cookies"
@@ -324,15 +336,125 @@ def _is_preply_host(host: str) -> bool:
     return text == "preply.com" or text.endswith(".preply.com")
 
 
+def _temp_sqlite_uri(path: Path) -> str:
+    """Read-only URI for a temp copy. Never used on the live browser file."""
+    return f"file:{path.as_posix()}?mode=ro&immutable=1"
+
+
 def _copy_sqlite(source: Path) -> Path:
+    """Copy a cookie database that the browser may still have open.
+
+    ``shutil.copy2`` / ``open()`` request exclusive access and raise WinError 32
+    while Opera, Chrome, Edge, Brave, or Firefox holds the file. A shared
+    ``CreateFileW`` read does not.
+    """
     folder = Path(tempfile.mkdtemp(prefix="preply-cookies-"))
     target = folder / "cookies.sqlite"
-    shutil.copy2(source, target)
-    for suffix in ("-wal", "-shm"):
+    _copy_bytes_shared(source, target)
+    for suffix in _SQLITE_SIDECARS:
         extra = Path(str(source) + suffix)
-        if extra.is_file():
-            shutil.copy2(extra, Path(str(target) + suffix))
+        try:
+            _copy_bytes_shared(extra, Path(str(target) + suffix))
+        except FileNotFoundError:
+            continue
     return target
+
+
+def _copy_bytes_shared(source: Path, target: Path) -> None:
+    try:
+        target.write_bytes(_shared_create_read(source))
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise BrowserCookieError(str(exc)) from exc
+
+
+def _shared_create_read(path: Path) -> bytes:
+    last: OSError | None = None
+    for attempt in range(3):
+        try:
+            return _read_with_shared_handle(path)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            last = exc
+            if getattr(exc, "winerror", None) != _SHARING_VIOLATION or attempt == 2:
+                raise
+            time.sleep(0.2)
+    assert last is not None
+    raise last
+
+
+def _read_with_shared_handle(path: Path) -> bytes:
+    kernel32 = _kernel32()
+    handle = kernel32.CreateFileW(
+        str(path),
+        _GENERIC_READ,
+        _FILE_SHARE_ALL,
+        None,
+        _OPEN_EXISTING,
+        _FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if _handle_invalid(handle):
+        error = ctypes.get_last_error()
+        if error in (2, 3):
+            raise FileNotFoundError(error, "The cookie file was not found.", str(path))
+        raise ctypes.WinError(error)
+    try:
+        return _read_handle(kernel32, handle)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _read_handle(kernel32, handle) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        size = 1024 * 1024
+        buffer = ctypes.create_string_buffer(size)
+        read = wintypes.DWORD(0)
+        ok = kernel32.ReadFile(handle, buffer, size, ctypes.byref(read), None)
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if read.value == 0:
+            break
+        chunks.append(buffer.raw[: read.value])
+    return b"".join(chunks)
+
+
+def _handle_invalid(handle) -> bool:
+    if not handle:
+        return True
+    value = int(handle)
+    return value in {0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF}
+
+
+def _kernel32():
+    global _KERNEL32
+    if _KERNEL32 is None:
+        library = ctypes.WinDLL("kernel32", use_last_error=True)
+        library.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        library.CreateFileW.restype = wintypes.HANDLE
+        library.ReadFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.c_void_p,
+        ]
+        library.ReadFile.restype = wintypes.BOOL
+        library.CloseHandle.argtypes = [wintypes.HANDLE]
+        library.CloseHandle.restype = wintypes.BOOL
+        _KERNEL32 = library
+    return _KERNEL32
 
 
 def _decrypt_chromium_value(encrypted: bytes, key: bytes | None) -> str:
