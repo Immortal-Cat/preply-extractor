@@ -925,6 +925,23 @@ class SeparateWindowTests(unittest.TestCase):
         server.listen(2)
         done = threading.Event()
 
+        def _discard_client_frame(conn: socket.socket, pending: bytes) -> bytes:
+            buffer = bytearray(pending)
+            while len(buffer) < 2:
+                buffer.extend(conn.recv(4096))
+            length = buffer[1] & 0x7F
+            offset = 2
+            if length == 126:
+                while len(buffer) < 4:
+                    buffer.extend(conn.recv(4096))
+                length = int.from_bytes(buffer[2:4], "big")
+                offset = 4
+            if buffer[1] & 0x80:
+                offset += 4
+            while len(buffer) < offset + length:
+                buffer.extend(conn.recv(4096))
+            return bytes(buffer[offset + length :])
+
         def handle(conn: socket.socket) -> None:
             try:
                 data = bytearray()
@@ -933,9 +950,15 @@ class SeparateWindowTests(unittest.TestCase):
                     if not chunk:
                         return
                     data.extend(chunk)
-                if data.startswith(b"GET /json/version"):
+                if data.startswith(b"GET /json/list"):
                     body = json.dumps(
-                        {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/test"}
+                        [
+                            {
+                                "type": "page",
+                                "url": "https://preply.com/en/practice/vocab-bank",
+                                "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/test",
+                            }
+                        ]
                     ).encode("utf-8")
                     head = (
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -945,12 +968,22 @@ class SeparateWindowTests(unittest.TestCase):
                     conn.sendall(head + body)
                     return
                 conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-                payload = json.dumps(
-                    {"id": 1, "result": {"cookies": [{"name": "sessionid", "value": "ok", "domain": ".preply.com", "path": "/"}]}}
-                ).encode("utf-8")
-                frame = bytearray([0x81, len(payload)])
-                frame.extend(payload)
-                conn.sendall(bytes(frame))
+                rest = data.split(b"\r\n\r\n", 1)[1]
+                replies = [
+                    {"id": 1, "result": {}},
+                    {
+                        "id": 2,
+                        "result": {
+                            "cookies": [
+                                {"name": "sessionid", "value": "ok", "domain": ".preply.com", "path": "/"}
+                            ]
+                        },
+                    },
+                ]
+                for reply in replies:
+                    rest = _discard_client_frame(conn, rest)
+                    payload = json.dumps(reply).encode("utf-8")
+                    conn.sendall(bytes([0x81, len(payload)]) + payload)
             finally:
                 conn.close()
                 done.set()
@@ -968,6 +1001,27 @@ class SeparateWindowTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in cookies], ["sessionid"])
         self.assertEqual(cookies[0]["domain"], ".preply.com")
         done.wait(2)
+
+    def test_preply_session_cookie_is_accepted_for_either_domain(self) -> None:
+        from preply_extractor.browser_login import cookies_from_browser_api
+        from preply_extractor.ui_text import tr
+
+        for domain in (".preply.com", "preply.com", "www.preply.com"):
+            cookies = cookies_from_browser_api(
+                [{"name": "sessionid", "value": "a" * 32, "domain": domain, "path": "/"}]
+            )
+            self.assertEqual([item["name"] for item in cookies], ["sessionid"])
+            self.assertEqual(cookies[0]["value"], "a" * 32)
+            self.assertTrue(str(cookies[0]["domain"]).endswith("preply.com"))
+        russian = tr("session_inactive", language="ru")
+        english = tr("session_inactive", language="en")
+        missing = tr("login_not_finished", language="ru")
+        self.assertIn("Я вошёл", russian)
+        self.assertNotIn("Обновить", russian)
+        self.assertIn("I've signed in", english)
+        self.assertNotIn("Refresh", english)
+        self.assertIn("Я вошёл", missing)
+        self.assertNotIn("Обновить", missing)
 
     def test_closed_context_during_sign_in_shows_a_short_message(self) -> None:
         _app()

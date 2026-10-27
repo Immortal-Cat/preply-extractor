@@ -230,8 +230,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "The sign-in browser is not installed. Click Retry.",
     },
     "session_inactive": {
-        "ru": "Сессия Preply не активна. Войдите в свой аккаунт в окне браузера и нажмите «Обновить».",
-        "en": "The Preply session is not active. Sign in to your account in the browser window and click Refresh.",
+        "ru": "Сессия Preply не активна. Завершите вход в окне Chrome и нажмите «Я вошёл».",
+        "en": "The Preply session is not active. Finish signing in in the Chrome window and click I've signed in.",
     },
     "browser_profile": {
         "ru": "Не удалось открыть окно входа. {text}",
@@ -343,8 +343,10 @@ def phrase_for_exception(exc: BaseException) -> tuple:
         or "executable doesn't exist" in lowered
     ):
         return ("browser", text)
-    if isinstance(exc, AuthRequired) or "sign" in lowered or "log in" in lowered or "login" in lowered:
+    if isinstance(exc, AuthRequired) or "log in" in lowered or "login" in lowered or "not authenticated" in lowered:
         return ("key", "session_inactive", {})
+    if "could not be read" in lowered or "did not return cookies" in lowered:
+        return ("key", "login_not_finished", {})
     if "could not open the browser profile" in lowered or "browser profile" in lowered:
         return ("key", "browser_profile", {"text": text})
     if text == "Нет подключения к Preply.":

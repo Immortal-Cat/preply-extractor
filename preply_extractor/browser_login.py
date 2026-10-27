@@ -125,8 +125,8 @@ def debug_port_is_open(port: int) -> bool:
         return False
 
 
-def _cdp_websocket_call(ws_url: str, port: int, payload: dict) -> dict:
-    """One CDP command on the localhost browser socket. The Chrome process stays open."""
+def _cdp_websocket_call(ws_url: str, port: int, commands: list[dict]) -> dict[int, dict]:
+    """CDP commands on one localhost page socket. The Chrome process stays open."""
     parsed = urlparse(ws_url)
     host = (parsed.hostname or "").lower()
     if host not in {"127.0.0.1", "localhost", "::1"} or parsed.port != port:
@@ -161,17 +161,21 @@ def _cdp_websocket_call(ws_url: str, port: int, payload: dict) -> dict:
         head, rest = bytes(buffer).split(b"\r\n\r\n", 1)
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise LoginWindowClosed("sign-in window was closed")
-        sock.sendall(_ws_client_text(json.dumps(payload).encode("utf-8")))
         pending = bytearray(rest)
-        while True:
-            text = _ws_next_text(sock, pending)
-            message = json.loads(text)
-            if message.get("id") != payload.get("id"):
-                continue
-            if message.get("error"):
-                raise BrowserCookieError("The sign-in window could not be read.")
-            result = message.get("result")
-            return result if isinstance(result, dict) else {}
+        results: dict[int, dict] = {}
+        for command in commands:
+            sock.sendall(_ws_client_text(json.dumps(command).encode("utf-8")))
+            while command.get("id") not in results:
+                text = _ws_next_text(sock, pending)
+                message = json.loads(text)
+                command_id = message.get("id")
+                if command_id is None:
+                    continue
+                if message.get("error"):
+                    raise BrowserCookieError("The window could not be read.")
+                result = message.get("result")
+                results[command_id] = result if isinstance(result, dict) else {}
+        return results
     finally:
         try:
             sock.close()
@@ -243,24 +247,57 @@ def _recv_some(sock: socket.socket) -> bytes:
     return chunk
 
 
-def cdp_network_cookies(port: int = LOGIN_DEBUG_PORT) -> list[dict]:
-    """``Network.getAllCookies`` from the dedicated Chrome. Does not open a cookie file."""
-    version_url = f"http://127.0.0.1:{port}/json/version"
+def _debug_targets(port: int) -> list:
     try:
-        with urllib.request.urlopen(version_url, timeout=3) as response:
-            info = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise LoginWindowClosed("sign-in window was closed") from exc
-    ws_url = str(info.get("webSocketDebuggerUrl") or "")
+    if not isinstance(payload, list):
+        raise LoginWindowClosed("sign-in window was closed")
+    return payload
+
+
+def _page_websocket(targets: list, port: int) -> str:
+    """Page socket for preply.com. The browser socket does not implement getAllCookies."""
+    fallback = ""
+    for target in targets:
+        if not isinstance(target, dict) or target.get("type") != "page":
+            continue
+        socket_url = str(target.get("webSocketDebuggerUrl") or "")
+        parsed = urlparse(socket_url)
+        if (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"} or parsed.port != port:
+            continue
+        host = (urlparse(str(target.get("url") or "")).hostname or "").lower().strip(".")
+        if host == "preply.com" or host.endswith(".preply.com"):
+            return socket_url
+        if not fallback:
+            fallback = socket_url
+    if not fallback:
+        raise LoginWindowClosed("sign-in window was closed")
+    return fallback
+
+
+def cdp_network_cookies(port: int = LOGIN_DEBUG_PORT) -> list[dict]:
+    """``Network.getAllCookies`` from the Preply page. Does not open a cookie file."""
+    page_socket = _page_websocket(_debug_targets(port), port)
     try:
-        result = _cdp_websocket_call(ws_url, port, {"id": 1, "method": "Network.getAllCookies"})
+        results = _cdp_websocket_call(
+            page_socket,
+            port,
+            [
+                {"id": 1, "method": "Network.enable"},
+                {"id": 2, "method": "Network.getAllCookies"},
+            ],
+        )
     except LoginWindowClosed:
         raise
     except (OSError, TimeoutError, json.JSONDecodeError) as exc:
         raise LoginWindowClosed("sign-in window was closed") from exc
+    result = results.get(2) if isinstance(results, dict) else None
     cookies = result.get("cookies") if isinstance(result, dict) else None
     if not isinstance(cookies, list):
-        raise BrowserCookieError("The sign-in window did not return cookies.")
+        raise BrowserCookieError("The window did not return cookies.")
     return cookies
 
 
@@ -662,7 +699,7 @@ def _chromium_profile_name(user_data: Path) -> str:
 
 
 def _is_preply_host(host: str) -> bool:
-    text = host.lstrip(".").lower()
+    text = host.strip().lower().strip(".")
     return text == "preply.com" or text.endswith(".preply.com")
 
 
