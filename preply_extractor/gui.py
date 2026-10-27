@@ -178,6 +178,10 @@ class ExportWorker(QThread):
         self._stop = True
         self._commands.put(("quit", None))
 
+    def release_session(self) -> None:
+        """Close an app-owned session, if one is open. Does not stop the worker."""
+        self._commands.put(("release", None))
+
     def run(self) -> None:
         while True:
             command, payload = self._commands.get()
@@ -195,6 +199,8 @@ class ExportWorker(QThread):
                     self._connect()
                 elif command == "load":
                     self._load(str(payload))
+                elif command == "release":
+                    self._close_session()
                 elif command == "build":
                     self._build(list(payload))
             except Exception as exc:
@@ -378,10 +384,15 @@ class ExportWorker(QThread):
                 self._emit_failure(self.build_failed, self._build_failed_queue, phrase_for_exception(exc))
 
     def _close_session(self) -> None:
+        """Close this app's session. A Playwright context is closed; Opera is not."""
         session = self._session
         self._session = None
-        if session is not None:
-            session.close()
+        if session is None:
+            return
+        context = getattr(session, "context", None)
+        if context is not None and hasattr(context, "close"):
+            context.close()
+        session.close()
 
 
 class DependencyPanel(QWidget):
@@ -763,11 +774,15 @@ class SavePanel(QWidget):
 
         buttons = QHBoxLayout()
         self.back_button = QPushButton(tr("back_to_words"))
+        self.restart_button = QPushButton(tr("start_again"))
+        self.restart_button.setEnabled(False)
+        self.restart_button.hide()
         self.save_button = QPushButton(tr("save"))
         self.save_button.setObjectName("primary")
         self.save_button.clicked.connect(lambda _checked=False: self._save())
         buttons.addWidget(self.back_button)
         buttons.addStretch(1)
+        buttons.addWidget(self.restart_button)
         buttons.addWidget(self.save_button)
         layout.addStretch(1)
         layout.addLayout(buttons)
@@ -825,13 +840,31 @@ class SavePanel(QWidget):
         self.browse_button.setText(tr("browse"))
         self.name_label.setText(tr("file_name"))
         self.back_button.setText(tr("back_to_words"))
+        self.restart_button.setText(tr("start_again"))
         self.save_button.setText(tr("save"))
         self._render_summary()
         if self._saved and self._saved_path is not None:
             self.success.setText(tr("deck_saved", path=self._saved_path))
             self.preview.setText(tr("file_will_be_saved", path=self._saved_path))
             self.save_button.setEnabled(False)
+            self.restart_button.setEnabled(True)
+            self.restart_button.show()
             return
+        self._refresh_preview()
+
+    def clear_finished_run(self) -> None:
+        """Forget the finished save in the window. Does not delete the saved file."""
+        self._temp_path = None
+        self._failures = []
+        self._saved = False
+        self._saved_path = None
+        self._reported_total = None
+        self.success.setText("")
+        self.summary.setText("")
+        self.restart_button.setEnabled(False)
+        self.restart_button.hide()
+        self.back_button.setEnabled(True)
+        self.name_edit.setEnabled(True)
         self._refresh_preview()
 
     def _browse(self) -> None:
@@ -896,6 +929,8 @@ class SavePanel(QWidget):
         self.save_button.setEnabled(False)
         self.back_button.setEnabled(False)
         self.name_edit.setEnabled(False)
+        self.restart_button.setEnabled(True)
+        self.restart_button.show()
 
 
 class MainWindow(QMainWindow):
@@ -986,6 +1021,7 @@ class MainWindow(QMainWindow):
         self.words_panel.switch_button.clicked.connect(lambda _checked=False: self._show_step(_STEP_LANGUAGE))
         self.build_panel.back_button.clicked.connect(lambda _checked=False: self._show_step(_STEP_WORDS))
         self.save_panel.back_button.clicked.connect(lambda _checked=False: self._back_to_words())
+        self.save_panel.restart_button.clicked.connect(lambda _checked=False: self._restart())
 
         self.worker = ExportWorker()
         self.worker.status_changed.connect(self._on_status)
@@ -1270,6 +1306,41 @@ class MainWindow(QMainWindow):
         if self.save_panel.saved():
             return
         self._show_step(_STEP_WORDS)
+
+    def _restart(self) -> None:
+        """Return to the dependency check so the export can be run again."""
+        if not self.save_panel.saved():
+            return
+        self._clear_temp_deck()
+        self.save_panel.clear_finished_run()
+        self.words_panel.set_words([], keep_checks=False)
+        self.words_panel.set_language("—", "", False)
+        self.words_panel.set_busy(True)
+        self.build_panel.reset(0)
+        self._build_total = 0
+        self._has_profile = False
+        self._profile_user_id = None
+        self._profile_display_name = None
+        self.profile_label.setText("")
+        self._languages = []
+        self._selected_alias = ""
+        self._chooser_needed = False
+        self.language_panel.language_list.clear()
+        self._rebuild_steps()
+        self.login_panel.authorize_button.setEnabled(True)
+        self.login_panel.continue_button.hide()
+        self._install_attempted = False
+        self._show_step(_STEP_DEPS)
+        self._apply_phrase("checking", ("key", "checking_components", {}))
+        self._ensure_worker()
+        self.worker.release_session()
+        self.worker.check_dependencies()
+
+    def _clear_temp_deck(self) -> None:
+        """Remove the temporary deck. The file the user already saved stays."""
+        if self._temp_dir is not None and self._temp_dir.exists():
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+        self._temp_dir = None
 
     def _discard_temp(self) -> None:
         if self.save_panel.saved():

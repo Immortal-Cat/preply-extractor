@@ -27,6 +27,7 @@ from preply_extractor.gui import (
     WordListPanel,
     _STEP_DEPS,
     _STEP_LOGIN,
+    _STEP_SAVE,
     russian_error,
 )
 from preply_extractor.gui_logic import (
@@ -544,6 +545,50 @@ class StartupFlowTests(unittest.TestCase):
         self.assertEqual(len(only_browser), 1)
         self.assertEqual(only_browser[0][-3:], ["playwright", "install", "chromium"])
         self.assertEqual(install_commands_for(_READY), [])
+
+    def test_start_again_returns_to_the_first_step_with_an_empty_word_list(self) -> None:
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            saved = Path(tmp) / "kept.apkg"
+            saved.write_bytes(b"saved-deck")
+            with (
+                patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None),
+                patch("preply_extractor.gui.open_in_default_browser") as opened,
+                patch("preply_extractor.preply_api.BrowserSession.__enter__") as launched,
+            ):
+                window = MainWindow(settings_file=path)
+                try:
+                    window.worker._commands.get_nowait()
+                    window.words_panel.set_words(_words(), keep_checks=False)
+                    window.words_panel.select_all()
+                    self.assertGreater(window.words_panel.word_list.count(), 0)
+                    self.assertGreater(len(window.words_panel.selected_words()), 0)
+                    window._temp_dir = Path(tmp) / "temp-deck"
+                    window._temp_dir.mkdir()
+                    window._show_step(_STEP_SAVE)
+                    window.save_panel._saved = True
+                    window.save_panel._saved_path = saved
+                    window.save_panel.restart_button.setEnabled(True)
+                    window.save_panel.restart_button.show()
+                    self.assertEqual(window.save_panel.restart_button.text(), "Начать заново")
+                    window.save_panel.restart_button.click()
+                    self.assertEqual(window.stack.currentIndex(), _STEP_DEPS)
+                    self.assertEqual(window.words_panel.word_list.count(), 0)
+                    self.assertEqual(window.words_panel.selected_words(), [])
+                    self.assertFalse(window.save_panel.saved())
+                    self.assertTrue(saved.is_file())
+                    self.assertFalse(window._temp_dir.exists() if window._temp_dir else False)
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "release")
+                    self.assertEqual(window.worker._commands.get_nowait()[0], "check")
+                    opened.assert_not_called()
+                    launched.assert_not_called()
+                    window._on_dependencies(dict(_READY))
+                    self.assertEqual(window.stack.currentIndex(), _STEP_LOGIN)
+                    opened.assert_not_called()
+                    launched.assert_not_called()
+                finally:
+                    window.close()
 
     def test_startup_check_does_not_open_a_browser_until_authorize(self) -> None:
         _app()

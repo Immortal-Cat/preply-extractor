@@ -197,6 +197,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "could_not_write": {"ru": "Не удалось записать файл.\n{error}", "en": "Could not write the file.\n{error}"},
     "deck_saved": {"ru": "Колода сохранена:\n{path}", "en": "Deck saved:\n{path}"},
     "save": {"ru": "Сохранить", "en": "Save"},
+    "start_again": {"ru": "Начать заново", "en": "Start again"},
     "deck_ready_partial": {
         "ru": "Колода собрана: {total} слов. Аудио скачано: {ready}. Не скачалось: {missed} ({names}{extra}). Эти слова всё равно в колоде.",
         "en": "Deck is ready: {total} words. Audio downloaded: {ready}. Not downloaded: {missed} ({names}{extra}). Those words are still in the deck.",
