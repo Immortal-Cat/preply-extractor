@@ -439,6 +439,28 @@ def _looks_like_html(body: str) -> bool:
     return stripped.startswith("<!doctype") or stripped.startswith("<html")
 
 
+def cookie_header_value(value: object) -> str | None:
+    """A cookie name or value HTTP can send as latin-1, or None when it cannot.
+
+    U+FFFD is never sent. It cannot be encoded as latin-1 and would crash the
+    Cookie header.
+    """
+    if isinstance(value, bytes):
+        try:
+            text = value.decode("utf-8")
+        except UnicodeDecodeError:
+            text = value.decode("latin-1")
+    else:
+        text = str(value or "")
+    if "\ufffd" in text:
+        return None
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
+    return text
+
+
 class RequestsSession:
     """Cookie-file session for the user's own exported browser cookies."""
 
@@ -487,12 +509,13 @@ class RequestsSession:
             }
         )
         for cookie in self._cookies:
-            session.cookies.set(
-                cookie["name"],
-                cookie["value"],
-                domain=cookie.get("domain") or ".preply.com",
-                path=cookie.get("path") or "/",
-            )
+            name = cookie_header_value(cookie.get("name"))
+            value = cookie_header_value(cookie.get("value"))
+            domain = cookie_header_value(cookie.get("domain")) or ".preply.com"
+            path = cookie_header_value(cookie.get("path")) or "/"
+            if not name or value is None:
+                continue
+            session.cookies.set(name, value, domain=domain, path=path)
         token = session.cookies.get("csrftoken") or session.cookies.get("csrf_token")
         if token:
             session.headers["x-csrftoken"] = token

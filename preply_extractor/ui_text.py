@@ -102,6 +102,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "ru": "В браузере по умолчанию ещё нет входа на preply.com. Завершите вход и нажмите «Я вошёл».",
         "en": "The default browser does not have a preply.com sign-in yet. Finish signing in and click I've signed in.",
     },
+    "session_cookie_unreadable": {
+        "ru": "Не удалось прочитать cookie входа на preply.com. Войдите снова и нажмите «Я вошёл».",
+        "en": "The preply.com sign-in cookie could not be read. Sign in again and click I've signed in.",
+    },
     "refreshing_list": {"ru": "Обновление списка…", "en": "Refreshing the list…"},
     "reading_profile": {"ru": "Чтение профиля…", "en": "Reading the profile…"},
     "profile_unreadable": {
@@ -328,6 +332,13 @@ def phrase_for_exception(exc: BaseException) -> tuple:
         return ("key", "browser_profile", {"text": text})
     if text == "Нет подключения к Preply.":
         return ("key", "not_connected", {})
+    if (
+        type(exc).__name__ == "UnreadableSessionCookie"
+        or "\ufffd" in text
+        or "ufffd" in lowered
+        or ("latin-1" in lowered and "codec" in lowered)
+    ):
+        return ("key", "session_cookie_unreadable", {})
     if not text:
         return ("key", "could_not_reach", {})
     return ("plain", text)

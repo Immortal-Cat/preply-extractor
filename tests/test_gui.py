@@ -955,6 +955,83 @@ class DefaultBrowserTests(unittest.TestCase):
             self.assertTrue(all(host.endswith("preply.com") for host in hosts))
             self.assertFalse(any("google" in host for host in hosts))
 
+    def test_invalid_utf8_cookie_does_not_break_the_latin1_header(self) -> None:
+        import requests
+
+        from preply_extractor.browser_login import (
+            UnreadableSessionCookie,
+            _cookie_text,
+            _decrypt_chromium_value,
+            require_preply_session,
+        )
+        from preply_extractor.preply_api import PreplyError, RequestsSession
+        from preply_extractor.ui_text import phrase_for_exception, phrase_text
+
+        with patch("preply_extractor.browser_login._aes_gcm_decrypt", return_value=b"\x01\xff"):
+            decoded = _decrypt_chromium_value(b"v10" + bytes(28), b"k" * 32)
+        decoded.encode("latin-1")
+        self.assertNotIn("\ufffd", decoded)
+        self.assertEqual(_cookie_text(b"\x01\xff"), decoded)
+
+        seen: dict[str, str] = {}
+
+        class Adapter(requests.adapters.BaseAdapter):
+            def send(self, request, **kwargs):
+                header = request.headers.get("Cookie", "")
+                header.encode("latin-1")
+                seen["cookie"] = header
+                response = requests.Response()
+                response.status_code = 200
+                response._content = b"{}"
+                response.url = request.url
+                response.headers["Content-Type"] = "application/json"
+                return response
+
+            def close(self) -> None:
+                return None
+
+        session = RequestsSession(
+            [
+                {"domain": ".preply.com", "name": "sessionid", "value": "kept", "path": "/"},
+                {"domain": ".preply.com", "name": "broken", "value": "\ufffd", "path": "/"},
+                {"domain": ".preply.com", "name": "raw", "value": decoded, "path": "/"},
+            ],
+            "en",
+        )
+        client = session._client()
+        client.mount("https://", Adapter())
+        session.post_json("/graphql/v2/VocabBankOverview", {})
+        header = seen["cookie"]
+        self.assertIn("sessionid=", header)
+        self.assertIn("raw=", header)
+        self.assertNotIn("broken=", header)
+        self.assertNotIn("\ufffd", header)
+        self.assertNotIn("latin-1", header)
+        kept = require_preply_session(
+            [
+                {"domain": ".preply.com", "name": "sessionid", "value": "kept", "path": "/"},
+                {"domain": ".preply.com", "name": "broken", "value": "\ufffd", "path": "/"},
+                {"domain": ".preply.com", "name": "raw", "value": decoded, "path": "/"},
+            ]
+        )
+        self.assertEqual([cookie["name"] for cookie in kept], ["sessionid", "raw"])
+        for cookie in kept:
+            cookie["value"].encode("latin-1")
+
+        with self.assertRaises(UnreadableSessionCookie):
+            require_preply_session(
+                [{"domain": ".preply.com", "name": "sessionid", "value": "\ufffd", "path": "/"}]
+            )
+        wrapped = PreplyError(
+            "Не удалось прочитать профиль. Список слов не загружен. "
+            "'latin-1' codec can't encode character '\\ufffd' in position 1: ordinal not in range(256)"
+        )
+        shown = phrase_text(phrase_for_exception(wrapped))
+        self.assertNotIn("ufffd", shown)
+        self.assertNotIn("latin-1", shown)
+        self.assertNotIn("Traceback", shown)
+        self.assertIn("preply.com", shown)
+
     def test_missing_session_cookie_does_not_open_playwright(self) -> None:
         _app()
         from preply_extractor.browser_login import NoPreplySession

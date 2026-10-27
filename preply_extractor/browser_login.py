@@ -23,7 +23,7 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from preply_extractor.preply_api import GRAPHQL_PATHS, RequestsSession
+from preply_extractor.preply_api import GRAPHQL_PATHS, RequestsSession, cookie_header_value
 
 PREPLY_AUTH_URL = "https://preply.com/en/practice/vocab-bank"
 _SESSION_COOKIE = "sessionid"
@@ -49,6 +49,10 @@ class NoPreplySession(RuntimeError):
 
 class BrowserCookieError(RuntimeError):
     """The default browser's cookie store could not be read."""
+
+
+class UnreadableSessionCookie(BrowserCookieError):
+    """The preply.com session cookie cannot be sent in an HTTP header."""
 
 
 class BrowserCookieSession:
@@ -126,13 +130,40 @@ def load_default_browser_preply_cookies(progid: str | None = None) -> list[dict]
 
 
 def require_preply_session(cookies: list[dict]) -> list[dict]:
-    """Keep preply.com cookies only, and require a non-empty sessionid."""
-    kept = [cookie for cookie in cookies if _is_preply_host(str(cookie.get("domain") or ""))]
-    signed_in = any(
-        str(cookie.get("name") or "") == _SESSION_COOKIE and str(cookie.get("value") or "").strip()
-        for cookie in kept
-    )
-    if not signed_in:
+    """Keep preply.com cookies only, and require a non-empty sessionid.
+
+    A cookie whose name or value cannot be sent as latin-1 is dropped. If that
+    cookie is the session itself, the caller gets a short error instead of a
+    header-encoding traceback.
+    """
+    kept: list[dict] = []
+    saw_session = False
+    saw_unreadable_session = False
+    for cookie in cookies:
+        if not _is_preply_host(str(cookie.get("domain") or "")):
+            continue
+        raw_name = str(cookie.get("name") or "")
+        raw_value = str(cookie.get("value") or "")
+        name = cookie_header_value(cookie.get("name"))
+        value = cookie_header_value(cookie.get("value"))
+        if raw_name == _SESSION_COOKIE and raw_value.strip() and (name != _SESSION_COOKIE or not value or not value.strip()):
+            saw_unreadable_session = True
+            continue
+        if not name or value is None:
+            continue
+        if name == _SESSION_COOKIE and value.strip():
+            saw_session = True
+        kept.append(
+            {
+                "domain": cookie_header_value(cookie.get("domain")) or ".preply.com",
+                "name": name,
+                "value": value,
+                "path": cookie_header_value(cookie.get("path")) or "/",
+            }
+        )
+    if not saw_session:
+        if saw_unreadable_session:
+            raise UnreadableSessionCookie("session cookie is unreadable")
         raise NoPreplySession("no preply.com session cookie")
     return kept
 
@@ -621,7 +652,19 @@ def _decrypt_chromium_value(encrypted: bytes, key: bytes | None) -> str:
         raise
     except Exception as exc:
         raise BrowserCookieError("This browser's cookie encryption could not be read.") from exc
-    return plain.decode("utf-8", errors="replace")
+    return _cookie_text(plain)
+
+
+def _cookie_text(raw: bytes) -> str:
+    """UTF-8 when every byte is valid UTF-8; otherwise latin-1.
+
+    latin-1 keeps the original bytes. ``errors='replace'`` would insert U+FFFD,
+    which an HTTP Cookie header cannot encode.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
 
 
 def _dpapi_decrypt(encrypted: bytes) -> bytes:
