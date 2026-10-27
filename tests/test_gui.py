@@ -100,6 +100,53 @@ class SavePathTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             join_deck_path(folder, "bad/name")
 
+    def test_save_button_stays_enabled_and_saves_again(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        from preply_extractor.gui import SavePanel
+
+        _app()
+        panel = SavePanel()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                folder = Path(tmp) / "decks"
+                built = Path(tmp) / "built.apkg"
+                built.write_bytes(b"first-bytes")
+                panel.set_result(built, [], 1)
+                panel.folder_edit.setText(str(folder))
+                panel.name_edit.setText("Deck")
+                panel._save()
+                first = folder / "Deck.apkg"
+                self.assertEqual(first.read_bytes(), b"first-bytes")
+                self.assertTrue(built.is_file())
+                self.assertTrue(panel.save_button.isEnabled())
+                self.assertIn(str(first), panel.success.text())
+
+                panel.name_edit.setText("Other")
+                panel._save()
+                second = folder / "Other.apkg"
+                self.assertEqual(second.read_bytes(), b"first-bytes")
+                self.assertTrue(first.is_file())
+                self.assertTrue(panel.save_button.isEnabled())
+                self.assertIn(str(second), panel.success.text())
+
+                built.write_bytes(b"replaced-bytes")
+                panel.name_edit.setText("Deck")
+                with patch("preply_extractor.gui.QMessageBox") as box:
+                    box.Icon = QMessageBox.Icon
+                    box.StandardButton = QMessageBox.StandardButton
+                    box.return_value.button.return_value = None
+                    box.return_value.exec.return_value = QMessageBox.StandardButton.No
+                    panel._save()
+                    self.assertEqual(first.read_bytes(), b"first-bytes")
+                    box.return_value.exec.return_value = QMessageBox.StandardButton.Yes
+                    panel._save()
+                    self.assertEqual(first.read_bytes(), b"replaced-bytes")
+                self.assertTrue(panel.save_button.isEnabled())
+                self.assertTrue(second.is_file())
+        finally:
+            panel.close()
+
 
 class ChromiumInstallTests(unittest.TestCase):
     def test_skips_install_when_browser_exists(self) -> None:

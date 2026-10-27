@@ -904,11 +904,8 @@ class SavePanel(QWidget):
         self._render_summary()
         if self._saved and self._saved_path is not None:
             self.success.setText(tr("deck_saved", path=self._saved_path))
-            self.preview.setText(tr("file_will_be_saved", path=self._saved_path))
-            self.save_button.setEnabled(False)
             self.restart_button.setEnabled(True)
             self.restart_button.show()
-            return
         self._refresh_preview()
 
     def clear_finished_run(self) -> None:
@@ -935,9 +932,6 @@ class SavePanel(QWidget):
         self._refresh_preview()
 
     def _refresh_preview(self) -> None:
-        if self._saved:
-            self.save_button.setEnabled(False)
-            return
         try:
             path = join_deck_path(self.folder_edit.text(), self.name_edit.text())
         except ValueError:
@@ -984,12 +978,10 @@ class SavePanel(QWidget):
         self._saved = True
         self._saved_path = destination
         self.success.setText(tr("deck_saved", path=destination))
-        self.preview.setText(tr("file_will_be_saved", path=destination))
-        self.save_button.setEnabled(False)
         self.back_button.setEnabled(False)
-        self.name_edit.setEnabled(False)
         self.restart_button.setEnabled(True)
         self.restart_button.show()
+        self._refresh_preview()
 
 
 class MainWindow(QMainWindow):
