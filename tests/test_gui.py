@@ -708,52 +708,31 @@ class StartupFlowTests(unittest.TestCase):
 
 
 class SeparateWindowTests(unittest.TestCase):
-    def test_authorize_starts_a_persistent_context_without_startfile(self) -> None:
+    def test_authorize_starts_normal_chrome_without_automation_flags(self) -> None:
         _app()
-        import hashlib
-
         from preply_extractor.browser_login import PREPLY_AUTH_URL, BrowserCookieError, SeparateProfileWindow
 
-        started: dict[str, object] = {}
-
-        class Page:
-            def goto(self, url, **_kwargs) -> None:
-                started["url"] = url
-
-        class Context:
-            pages: list = []
-
-            def new_page(self) -> Page:
-                return Page()
-
-            def close(self) -> None:
-                started["closed"] = True
-
-            def cookies(self) -> list[dict]:
-                started["cookies_read"] = True
-                host = ".preply.com"
-                raw = hashlib.sha256(host.encode("utf-8")).digest() + b"ok"
-                return [
-                    {"name": "sessionid", "value": raw.decode("latin-1"), "domain": host, "path": "/"},
-                    {"name": "sid", "value": "other-site", "domain": ".google.com", "path": "/"},
-                ]
-
-        class Bundle:
+        class Proc:
             def __init__(self) -> None:
-                self.chromium = self
+                self.alive = True
 
-            def launch_persistent_context(self, user_data_dir, **kwargs):
-                started["dir"] = str(user_data_dir)
-                started["kwargs"] = dict(kwargs)
-                return Context()
+            def poll(self) -> int | None:
+                return None if self.alive else 0
 
-            def stop(self) -> None:
-                started["stopped"] = True
+            def terminate(self) -> None:
+                self.alive = False
 
-        class Manager:
-            def start(self) -> Bundle:
-                return Bundle()
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
 
+        commands: list[list[str]] = []
+
+        def popen(command, **kwargs):
+            self.assertNotIn("shell", kwargs)
+            commands.append(list(command))
+            return Proc()
+
+        chrome = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
         worker = ExportWorker()
         opened: list[bool] = []
         worker.login_window_opened.connect(lambda: opened.append(True))
@@ -761,120 +740,234 @@ class SeparateWindowTests(unittest.TestCase):
             profile = Path(tmp) / ".preply-profile"
             with (
                 patch("os.startfile", side_effect=AssertionError("tab")),
-                patch("preply_extractor.gui.program_profile_directory", return_value=profile),
-                patch("preply_extractor.gui.preferred_browser_channel", return_value="chrome"),
-                patch("playwright.sync_api.sync_playwright", return_value=Manager()),
+                patch("playwright.sync_api.sync_playwright", side_effect=AssertionError("playwright launch")),
                 patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
-                patch("preply_extractor.browser_login._copy_bytes_shared", side_effect=AssertionError("opera")),
+                patch("preply_extractor.browser_login.debug_port_is_open", return_value=False),
+                patch("preply_extractor.browser_login.installed_chrome_path", return_value=chrome),
+                patch("preply_extractor.browser_login.subprocess.Popen", side_effect=popen),
+                patch("preply_extractor.gui.program_profile_directory", return_value=profile),
             ):
                 worker._open_login()
-                chrome_kwargs = dict(started["kwargs"])
-                cookies = worker._login.read_preply_cookies()
-                plain = SeparateProfileWindow(profile, None)
-                plain.open(PREPLY_AUTH_URL)
-                bundled_kwargs = dict(started["kwargs"])
-            self.assertEqual(opened, [True])
-            self.assertTrue(str(started["dir"]).endswith(".preply-profile"))
-            self.assertNotIn("opera software", str(started["dir"]).lower())
-            self.assertEqual(chrome_kwargs["channel"], "chrome")
-            self.assertIs(chrome_kwargs["headless"], False)
-            self.assertNotIn("channel", bundled_kwargs)
-            self.assertEqual(started["url"], PREPLY_AUTH_URL)
-            self.assertTrue(started["cookies_read"])
-            self.assertEqual([item["name"] for item in cookies], ["sessionid"])
-            self.assertEqual(cookies[0]["value"], "ok")
-            self.assertNotIn("\ufffd", cookies[0]["value"])
+                worker._open_login()
+                self.assertEqual(len(commands), 1)
+                worker._login._process.alive = False
+                worker._open_login()
+            command = commands[0]
+            joined = " ".join(command).lower()
+            directory = next(part.split("=", 1)[1] for part in command if part.startswith("--user-data-dir="))
+            self.assertTrue(str(directory).endswith(".preply-profile"))
+            self.assertIn("--remote-debugging-port=9333", command)
+            self.assertNotIn("--enable-automation", joined)
+            self.assertNotIn("--headless", joined)
+            self.assertNotIn("automationcontrolled", joined)
+            self.assertNotIn("opera software", joined)
+            self.assertNotIn("\\user data", directory.lower())
+            self.assertEqual(command[-1], PREPLY_AUTH_URL)
+            self.assertEqual(command[0], str(chrome))
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(opened, [True, True, True])
             self.assertTrue(profile.is_dir())
         appdata = os.environ.get("APPDATA", "")
         with self.assertRaises(BrowserCookieError):
-            SeparateProfileWindow(Path(appdata) / "Opera Software" / "Opera Stable", "chrome")
+            SeparateProfileWindow(Path(appdata) / "Opera Software" / "Opera Stable")
+        local = os.environ.get("LOCALAPPDATA", "")
+        with self.assertRaises(BrowserCookieError):
+            SeparateProfileWindow(Path(local) / "Google" / "Chrome" / "User Data")
 
-    def test_closed_context_is_replaced_on_the_next_authorize(self) -> None:
+    def test_signed_in_reads_the_debug_port_not_a_cookie_file(self) -> None:
         _app()
-        from preply_extractor.browser_login import PREPLY_AUTH_URL, SeparateProfileWindow
+        import hashlib
 
-        class TargetClosedError(Exception):
-            pass
+        from preply_extractor.browser_login import SeparateProfileWindow
 
-        launches: list[str] = []
-        visited: list[str] = []
-
-        class DeadPage:
-            def is_closed(self) -> bool:
-                return True
-
-            def goto(self, _url: str, **_kwargs) -> None:
-                raise TargetClosedError("browser-context page context for browser has been closed")
-
-        class DeadContext:
+        class Proc:
             def __init__(self) -> None:
-                self.pages = [DeadPage()]
-                self.closed = False
+                self.terminated = False
 
-            def new_page(self) -> None:
-                raise TargetClosedError("browser-context page context for browser has been closed")
-
-            def close(self) -> None:
-                self.closed = True
-
-        class LivePage:
-            def is_closed(self) -> bool:
-                return False
-
-            def goto(self, url: str, **_kwargs) -> None:
-                visited.append(url)
-
-        class LiveContext:
-            def __init__(self) -> None:
-                self.pages: list[LivePage] = []
-
-            def new_page(self) -> LivePage:
-                page = LivePage()
-                self.pages.append(page)
-                return page
-
-            def close(self) -> None:
+            def poll(self) -> None:
                 return None
 
-        class Bundle:
-            def __init__(self) -> None:
-                self.chromium = self
+            def terminate(self) -> None:
+                self.terminated = True
 
-            def launch_persistent_context(self, user_data_dir, **_kwargs):
-                launches.append(str(user_data_dir))
-                return LiveContext()
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
 
-            def stop(self) -> None:
-                return None
+        seen: dict[str, object] = {}
 
-        class Manager:
-            def start(self) -> Bundle:
-                return Bundle()
+        def cookies(port: int) -> list[dict]:
+            seen["port"] = port
+            seen["endpoint"] = f"http://127.0.0.1:{port}/json/version"
+            host = ".preply.com"
+            raw = hashlib.sha256(host.encode("utf-8")).digest() + b"ok"
+            return [
+                {"name": "sessionid", "value": raw.decode("latin-1"), "domain": host, "path": "/"},
+                {"name": "sid", "value": "other", "domain": ".google.com", "path": "/"},
+            ]
 
-        dead = DeadContext()
+        def session_from_cookies(cookie_list, _language):
+            self.assertEqual([item["name"] for item in cookie_list], ["sessionid"])
+            self.assertEqual(cookie_list[0]["value"], "ok")
+            session = type("Session", (), {})()
+            session.endpoint = "/graphql/v2"
+            session.post_json = lambda *_args, **_kwargs: (200, "{}")
+            session.close = lambda: None
+            return session
+
         with tempfile.TemporaryDirectory() as tmp:
-            profile = Path(tmp) / ".preply-profile"
-            window = SeparateProfileWindow(profile, "chrome")
-            window._context = dead
-            window._playwright = Bundle()
+            window = SeparateProfileWindow(Path(tmp) / ".preply-profile")
+            process = Proc()
+            window._process = process
             worker = ExportWorker()
+            ready: list[object] = []
+            worker.profile_ready.connect(ready.append)
             worker._login = window
-            opened: list[bool] = []
-            worker.login_window_opened.connect(lambda: opened.append(True))
             with (
                 patch("os.startfile", side_effect=AssertionError("tab")),
-                patch("playwright.sync_api.sync_playwright", return_value=Manager()),
+                patch("playwright.sync_api.sync_playwright", side_effect=AssertionError("playwright launch")),
                 patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
+                patch("preply_extractor.browser_login._copy_bytes_shared", side_effect=AssertionError("opera")),
+                patch("preply_extractor.browser_login.cdp_network_cookies", side_effect=cookies),
+                patch("preply_extractor.gui.BrowserCookieSession", side_effect=session_from_cookies),
+                patch("preply_extractor.gui.fetch_learner_profile", return_value=object()),
+            ):
+                worker._connect()
+            self.assertEqual(seen["port"], 9333)
+            self.assertEqual(seen["endpoint"], "http://127.0.0.1:9333/json/version")
+            self.assertEqual(len(ready), 1)
+            self.assertIsNone(window._process)
+            self.assertTrue(process.terminated)
+
+    def test_closed_debug_port_shows_the_closed_window_message(self) -> None:
+        _app()
+        from preply_extractor.browser_login import SeparateProfileWindow
+
+        worker = ExportWorker()
+        failed: list[str] = []
+        worker.connect_failed.connect(failed.append)
+        with tempfile.TemporaryDirectory() as tmp:
+            worker._login = SeparateProfileWindow(Path(tmp) / ".preply-profile")
+            with (
+                patch("preply_extractor.browser_login.debug_port_is_open", return_value=False),
+                patch("preply_extractor.browser_login.cdp_network_cookies", side_effect=AssertionError("cdp")),
+                patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
+                patch("playwright.sync_api.sync_playwright", side_effect=AssertionError("playwright launch")),
+            ):
+                worker._connect()
+        self.assertEqual(len(failed), 1)
+        self.assertIn("Окно входа закрыто", failed[0])
+        self.assertIn("Авторизоваться", failed[0])
+        self.assertNotIn("traceback", failed[0].lower())
+
+    def test_missing_chrome_is_reported_without_playwright(self) -> None:
+        _app()
+        worker = ExportWorker()
+        failed: list[str] = []
+        worker.connect_failed.connect(failed.append)
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("preply_extractor.gui.program_profile_directory", return_value=Path(tmp) / ".preply-profile"),
+                patch("preply_extractor.browser_login.debug_port_is_open", return_value=False),
+                patch("preply_extractor.browser_login.installed_chrome_path", return_value=None),
+                patch("preply_extractor.browser_login.subprocess.Popen", side_effect=AssertionError("chrome")),
+                patch("playwright.sync_api.sync_playwright", side_effect=AssertionError("playwright launch")),
             ):
                 worker._open_login()
-                worker._open_login()
-            self.assertEqual(opened, [True, True])
-            self.assertEqual(len(launches), 1)
-            self.assertTrue(launches[0].endswith(".preply-profile"))
-            self.assertNotIn("opera software", launches[0].lower())
-            self.assertEqual(visited, [PREPLY_AUTH_URL, PREPLY_AUTH_URL])
-            self.assertTrue(dead.closed)
-            self.assertIs(worker._login, window)
+        self.assertEqual(len(failed), 1)
+        self.assertIn("Google Chrome не найден", failed[0])
+        self.assertNotIn("chromium", failed[0].lower())
+
+    def test_missing_session_leaves_the_chrome_window_open(self) -> None:
+        _app()
+        from preply_extractor.browser_login import SeparateProfileWindow
+
+        class Proc:
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+        worker = ExportWorker()
+        failed: list[str] = []
+        worker.connect_failed.connect(failed.append)
+        with tempfile.TemporaryDirectory() as tmp:
+            window = SeparateProfileWindow(Path(tmp) / ".preply-profile")
+            process = Proc()
+            window._process = process
+            worker._login = window
+
+            def cookies(_port: int) -> list[dict]:
+                return [{"name": "csrftoken", "value": "token", "domain": ".preply.com", "path": "/"}]
+
+            with (
+                patch("preply_extractor.browser_login.cdp_network_cookies", side_effect=cookies),
+                patch("preply_extractor.browser_login.chromium_cookie_database", side_effect=AssertionError("opera")),
+                patch("playwright.sync_api.sync_playwright", side_effect=AssertionError("playwright launch")),
+            ):
+                worker._connect()
+        self.assertIn("Я вошёл", failed[0])
+        self.assertFalse(process.terminated)
+        self.assertIs(worker._login, window)
+
+    def test_cdp_client_uses_the_localhost_debug_socket(self) -> None:
+        import socket
+        import threading
+
+        from preply_extractor.browser_login import cdp_network_cookies
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        port = server.getsockname()[1]
+        server.listen(2)
+        done = threading.Event()
+
+        def handle(conn: socket.socket) -> None:
+            try:
+                data = bytearray()
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    data.extend(chunk)
+                if data.startswith(b"GET /json/version"):
+                    body = json.dumps(
+                        {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/test"}
+                    ).encode("utf-8")
+                    head = (
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                        + str(len(body)).encode("ascii")
+                        + b"\r\nConnection: close\r\n\r\n"
+                    )
+                    conn.sendall(head + body)
+                    return
+                conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                payload = json.dumps(
+                    {"id": 1, "result": {"cookies": [{"name": "sessionid", "value": "ok", "domain": ".preply.com", "path": "/"}]}}
+                ).encode("utf-8")
+                frame = bytearray([0x81, len(payload)])
+                frame.extend(payload)
+                conn.sendall(bytes(frame))
+            finally:
+                conn.close()
+                done.set()
+
+        def accept_loop() -> None:
+            for _ in range(2):
+                conn, _addr = server.accept()
+                threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+        try:
+            cookies = cdp_network_cookies(port)
+        finally:
+            server.close()
+        self.assertEqual([item["name"] for item in cookies], ["sessionid"])
+        self.assertEqual(cookies[0]["domain"], ".preply.com")
+        done.wait(2)
 
     def test_closed_context_during_sign_in_shows_a_short_message(self) -> None:
         _app()

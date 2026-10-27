@@ -98,8 +98,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "en": "Opening a separate sign-in window…",
     },
     "login_opened": {
-        "ru": "Отдельное окно открыто. Войдите в свой аккаунт Preply в нём и нажмите «Я вошёл». Первый раз Google подтверждается в этом окне, дальше оно помнит вход. Пароль программа не спрашивает.",
-        "en": "A separate window is open. Sign in to your Preply account there and click I've signed in. The first time, sign in to Google in this window; later runs reuse it. The program does not ask for your password.",
+        "ru": "Отдельное окно Chrome открыто. Войдите через Google в этом окне и нажмите «Я вошёл». Этот вход запоминается. Обычное окно Opera остаётся открытым. Пароль программа не спрашивает.",
+        "en": "A separate Chrome window is open. Sign in with Google there and click I've signed in. That sign-in is remembered. Your usual Opera window stays open. The program does not ask for your password.",
     },
     "signed_in": {"ru": "Я вошёл", "en": "I've signed in"},
     "login_not_finished": {
@@ -109,6 +109,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "login_window_closed": {
         "ru": "Окно входа закрыто. Нажмите «Авторизоваться на Preply» ещё раз.",
         "en": "The sign-in window was closed. Click Authorize on Preply again.",
+    },
+    "chrome_missing": {
+        "ru": "Google Chrome не найден. Установите Chrome и нажмите «Авторизоваться на Preply» ещё раз.",
+        "en": "Google Chrome was not found. Install Chrome and click Authorize on Preply again.",
     },
     "session_cookie_unreadable": {
         "ru": "Не удалось прочитать cookie входа на preply.com. Войдите снова и нажмите «Я вошёл».",
@@ -166,8 +170,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "downloading_audio": {"ru": "Скачивание произношения…", "en": "Downloading pronunciation…"},
     "writing_deck": {"ru": "Запись файла колоды…", "en": "Writing the deck file…"},
     "login_hint": {
-        "ru": "Компоненты уже проверены. Кнопка откроет отдельное окно со своим профилем, не вкладку в Opera. Первый раз войдите в Google в этом окне — потом оно запомнит вход. Основное окно Opera не закрывается. Пароль программа не спрашивает. Когда войдёте, нажмите «Я вошёл».",
-        "en": "The components are already checked. The button opens a separate window with this program's own profile, not a tab in Opera. The first time, sign in to Google in that window; later runs reuse it. Your main Opera window stays open. The program does not ask for your password. After you sign in, click I've signed in.",
+        "ru": "Компоненты уже проверены. Кнопка откроет отдельное окно Chrome. Войдите через Google в нём один раз — дальше вход запоминается. Обычное окно Opera остаётся открытым. Пароль программа не спрашивает. Когда войдёте, нажмите «Я вошёл».",
+        "en": "The components are already checked. The button opens a separate Chrome window. Sign in with Google there once; later runs remember it. Your usual Opera window stays open. The program does not ask for your password. After you sign in, click I've signed in.",
     },
     "retry": {"ru": "Повторить", "en": "Retry"},
     "choose_language_title": {"ru": "Выберите язык", "en": "Choose a language"},
@@ -327,6 +331,8 @@ def phrase_for_exception(exc: BaseException) -> tuple:
     """A value ``phrase_text`` can render again after the interface language changes."""
     text = str(exc).strip()
     lowered = text.lower()
+    if type(exc).__name__ == "ChromeNotInstalled":
+        return ("key", "chrome_missing", {})
     if type(exc).__name__ in {"LoginWindowClosed", "TargetClosedError"} or "has been closed" in lowered or "target closed" in lowered:
         return ("key", "login_window_closed", {})
     if (

@@ -1,10 +1,9 @@
-"""Sign in through a separate browser profile, then reuse those cookies.
+"""Sign in through a normal Chrome window on this program's own profile.
 
-``os.startfile`` on an https URL is ShellExecute. The registered browser,
-including Opera, opens that URL as a tab in the process that is already
-running. The desktop window does not use that path. It opens Playwright's
-persistent context on this program's own profile directory and reads cookies
-from that context. It does not open Opera's cookie database.
+Google rejects a Playwright launch because it adds ``--enable-automation``.
+Authorize starts ``chrome.exe`` with a dedicated ``--user-data-dir`` and reads
+preply.com cookies over that window's debugging port. It does not open Opera's
+or Chrome's cookie database, and it does not attach to those everyday windows.
 
 ``open_in_default_browser`` remains for the ShellExecute behavior itself.
 Cookie values are never written to logs or error text.
@@ -12,25 +11,33 @@ Cookie values are never written to logs or error text.
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import hashlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
+import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from ctypes import wintypes
 from pathlib import Path
+from urllib.parse import urlparse
 
 from preply_extractor.preply_api import (
     GRAPHQL_PATHS,
     RequestsSession,
     browser_context_closed,
     cookie_header_value,
+    installed_chrome_path,
 )
 
 PREPLY_AUTH_URL = "https://preply.com/en/practice/vocab-bank"
+LOGIN_DEBUG_PORT = 9333
 _SESSION_COOKIE = "sessionid"
 _HTTPS_USER_CHOICE = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
 _GENERIC_READ = 0x80000000
@@ -60,6 +67,10 @@ class LoginWindowClosed(RuntimeError):
     """The separate sign-in window was closed before sign-in finished."""
 
 
+class ChromeNotInstalled(BrowserCookieError):
+    """Google Chrome is not installed, so Google sign-in cannot be opened."""
+
+
 class UnreadableSessionCookie(BrowserCookieError):
     """The preply.com session cookie cannot be sent in an HTTP header."""
 
@@ -81,124 +92,232 @@ class BrowserCookieSession:
         self._inner.close()
 
 
-class SeparateProfileWindow:
-    """Playwright window on this program's profile. The main Opera window is not touched."""
+def _reject_foreign_profile(path: Path) -> None:
+    """This window may use only the program profile, never Opera or everyday Chrome."""
+    text = str(path).lower().replace("/", "\\")
+    if "opera software" in text:
+        raise BrowserCookieError("The sign-in window cannot use the main Opera profile.")
+    if "\\google\\chrome\\user data" in text:
+        raise BrowserCookieError("The sign-in window cannot use the main Chrome profile.")
 
-    def __init__(self, user_data_dir: Path | str, channel: str | None) -> None:
+
+def chrome_sign_in_command(executable: Path, user_data_dir: Path, url: str, port: int = LOGIN_DEBUG_PORT) -> list[str]:
+    """Normal Chrome argv. No automation flag, no headless mode, no default profile."""
+    profile = Path(user_data_dir).resolve()
+    _reject_foreign_profile(profile)
+    if not str(url).startswith("https://"):
+        raise BrowserCookieError("Only an https Preply address can be opened.")
+    return [
+        str(executable),
+        f"--user-data-dir={profile}",
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url,
+    ]
+
+
+def debug_port_is_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _cdp_websocket_call(ws_url: str, port: int, payload: dict) -> dict:
+    """One CDP command on the localhost browser socket. The Chrome process stays open."""
+    parsed = urlparse(ws_url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"} or parsed.port != port:
+        raise LoginWindowClosed("sign-in window was closed")
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    )
+    connect_host = "::1" if host == "::1" else "127.0.0.1"
+    try:
+        sock = socket.create_connection((connect_host, port), timeout=5)
+    except OSError as exc:
+        raise LoginWindowClosed("sign-in window was closed") from exc
+    try:
+        sock.settimeout(5)
+        sock.sendall(request.encode("ascii"))
+        buffer = bytearray()
+        while b"\r\n\r\n" not in buffer:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise LoginWindowClosed("sign-in window was closed")
+            buffer.extend(chunk)
+        head, rest = bytes(buffer).split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise LoginWindowClosed("sign-in window was closed")
+        sock.sendall(_ws_client_text(json.dumps(payload).encode("utf-8")))
+        pending = bytearray(rest)
+        while True:
+            text = _ws_next_text(sock, pending)
+            message = json.loads(text)
+            if message.get("id") != payload.get("id"):
+                continue
+            if message.get("error"):
+                raise BrowserCookieError("The sign-in window could not be read.")
+            result = message.get("result")
+            return result if isinstance(result, dict) else {}
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _ws_client_text(payload: bytes) -> bytes:
+    mask = os.urandom(4)
+    header = bytearray([0x81])
+    length = len(payload)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.append(0x80 | 126)
+        header.extend(length.to_bytes(2, "big"))
+    else:
+        header.append(0x80 | 127)
+        header.extend(length.to_bytes(8, "big"))
+    header.extend(mask)
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    return bytes(header) + masked
+
+
+def _ws_next_text(sock: socket.socket, pending: bytearray) -> str:
+    while True:
+        while len(pending) < 2:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise LoginWindowClosed("sign-in window was closed")
+            pending.extend(chunk)
+        length = pending[1] & 0x7F
+        offset = 2
+        if length == 126:
+            while len(pending) < 4:
+                pending.extend(_recv_some(sock))
+            length = int.from_bytes(pending[2:4], "big")
+            offset = 4
+        elif length == 127:
+            while len(pending) < 10:
+                pending.extend(_recv_some(sock))
+            length = int.from_bytes(pending[2:10], "big")
+            offset = 10
+        masked = (pending[1] & 0x80) != 0
+        if masked:
+            while len(pending) < offset + 4:
+                pending.extend(_recv_some(sock))
+            mask = bytes(pending[offset : offset + 4])
+            offset += 4
+        else:
+            mask = b""
+        while len(pending) < offset + length:
+            pending.extend(_recv_some(sock))
+        payload = bytes(pending[offset : offset + length])
+        opcode = pending[0] & 0x0F
+        del pending[: offset + length]
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        if opcode == 0x1:
+            return payload.decode("utf-8")
+        if opcode == 0x8:
+            raise LoginWindowClosed("sign-in window was closed")
+
+
+def _recv_some(sock: socket.socket) -> bytes:
+    chunk = sock.recv(4096)
+    if not chunk:
+        raise LoginWindowClosed("sign-in window was closed")
+    return chunk
+
+
+def cdp_network_cookies(port: int = LOGIN_DEBUG_PORT) -> list[dict]:
+    """``Network.getAllCookies`` from the dedicated Chrome. Does not open a cookie file."""
+    version_url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        with urllib.request.urlopen(version_url, timeout=3) as response:
+            info = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise LoginWindowClosed("sign-in window was closed") from exc
+    ws_url = str(info.get("webSocketDebuggerUrl") or "")
+    try:
+        result = _cdp_websocket_call(ws_url, port, {"id": 1, "method": "Network.getAllCookies"})
+    except LoginWindowClosed:
+        raise
+    except (OSError, TimeoutError, json.JSONDecodeError) as exc:
+        raise LoginWindowClosed("sign-in window was closed") from exc
+    cookies = result.get("cookies") if isinstance(result, dict) else None
+    if not isinstance(cookies, list):
+        raise BrowserCookieError("The sign-in window did not return cookies.")
+    return cookies
+
+
+class SeparateProfileWindow:
+    """Normal Chrome on this program's profile. Opera and everyday Chrome stay untouched."""
+
+    def __init__(self, user_data_dir: Path | str, channel: str | None = None) -> None:
         resolved = Path(user_data_dir).resolve()
-        if "opera software" in str(resolved).lower():
-            raise BrowserCookieError("The sign-in window cannot use the main Opera profile.")
+        _reject_foreign_profile(resolved)
         self.user_data_dir = str(resolved)
-        self.channel = channel or None
-        self._playwright = None
-        self._context = None
+        self._process: subprocess.Popen | None = None
+
+    def _process_alive(self) -> bool:
+        process = self._process
+        return process is not None and process.poll() is None
 
     @property
     def is_open(self) -> bool:
-        try:
-            return self._context_is_usable()
-        except Exception as exc:
-            if context_was_closed(exc):
-                return False
-            raise
+        return self._process_alive() or debug_port_is_open(LOGIN_DEBUG_PORT)
 
     def open(self, url: str) -> None:
-        """Navigate the current window, or launch a new one when that window is gone."""
+        """Start Chrome when the previous dedicated window is gone. Never starts a second one."""
         if not url.startswith("https://"):
             raise BrowserCookieError("Only an https Preply address can be opened.")
-        if self._context is not None:
-            try:
-                if self._context_is_usable():
-                    self._goto(url)
-                    return
-            except Exception as exc:
-                if not context_was_closed(exc):
-                    raise
-            self._discard_closed()
-        self._launch(url)
+        if self._process_alive() or debug_port_is_open(LOGIN_DEBUG_PORT):
+            return
+        chrome = installed_chrome_path()
+        if chrome is None:
+            raise ChromeNotInstalled("Google Chrome is not installed")
+        Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
+        command = chrome_sign_in_command(chrome, Path(self.user_data_dir), url, LOGIN_DEBUG_PORT)
+        self._process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def read_preply_cookies(self) -> list[dict]:
-        """preply.com cookies from this window. Does not open a cookie database."""
+        """preply.com cookies from the debug port. Does not open a cookie database."""
         if not self.is_open:
-            self._discard_closed()
             raise LoginWindowClosed("sign-in window was closed")
         try:
-            raw = list(self._context.cookies())
-        except Exception as exc:
-            if context_was_closed(exc):
-                self._discard_closed()
-                raise LoginWindowClosed("sign-in window was closed") from exc
+            raw = cdp_network_cookies(LOGIN_DEBUG_PORT)
+        except LoginWindowClosed:
+            if self._process_alive():
+                raise NoPreplySession("no preply.com session cookie")
             raise
         return cookies_from_browser_api(raw)
 
     def close(self) -> None:
-        self._discard_closed()
-
-    def _context_is_usable(self) -> bool:
-        """True when this context can still open a page. A closed window is not usable."""
-        context = self._context
-        if context is None:
-            return False
-        for page in context.pages:
-            checker = getattr(page, "is_closed", None)
-            if callable(checker) and checker():
-                continue
-            return True
-        return True
-
-    def _goto(self, url: str) -> None:
-        context = self._context
-        page = None
-        for candidate in context.pages:
-            checker = getattr(candidate, "is_closed", None)
-            if callable(checker) and checker():
-                continue
-            page = candidate
-            break
-        if page is None:
-            page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-
-    def _launch(self, url: str) -> None:
-        Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
-        from playwright.sync_api import sync_playwright
-
-        playwright = sync_playwright().start()
-        launch_kwargs = {
-            "headless": False,
-            "viewport": {"width": 1280, "height": 900},
-        }
-        if self.channel:
-            launch_kwargs["channel"] = self.channel
+        """Stop only the Chrome process this window started."""
+        process = self._process
+        self._process = None
+        if process is None:
+            return
         try:
-            context = playwright.chromium.launch_persistent_context(self.user_data_dir, **launch_kwargs)
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
         except Exception:
-            playwright.stop()
-            raise
-        self._playwright = playwright
-        self._context = context
-        try:
-            self._goto(url)
-        except Exception:
-            self._discard_closed()
-            raise
-
-    def _discard_closed(self) -> None:
-        """Forget a context the user already closed. Opera is not touched."""
-        context = self._context
-        playwright = self._playwright
-        self._context = None
-        self._playwright = None
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
-        if playwright is not None:
-            try:
-                playwright.stop()
-            except Exception:
-                pass
+            return
 
 
 def context_was_closed(exc: BaseException) -> bool:

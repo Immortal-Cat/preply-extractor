@@ -67,7 +67,6 @@ from preply_extractor.preply_api import (
     SessionCancelled,
     fetch_learner_profile,
     fetch_vocabulary,
-    preferred_browser_channel,
 )
 from preply_extractor.settings_dialog import SettingsDialog
 from preply_extractor.themes import apply_theme, normalize_theme
@@ -309,10 +308,7 @@ class ExportWorker(QThread):
             return
         try:
             if self._login is None:
-                self._login = SeparateProfileWindow(
-                    program_profile_directory(),
-                    preferred_browser_channel(),
-                )
+                self._login = SeparateProfileWindow(program_profile_directory())
             self._login.open(PREPLY_AUTH_URL)
         except Exception as exc:
             if context_was_closed(exc):
