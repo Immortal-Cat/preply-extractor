@@ -10,8 +10,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -82,6 +82,27 @@ from preply_extractor.ui_text import (
 from preply_extractor.words import VocabWord
 
 PROFILE_DIR = Path(".preply-profile")
+
+
+def _gear_icon(color: str = "#2dd4bf", size: int = 18) -> QIcon:
+    """A small turquoise gear for the navy header. Not a text label."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.6)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.translate(size / 2, size / 2)
+    tooth = QRectF(-1.35, -(size * 0.46), 2.7, size * 0.16)
+    for _tooth in range(8):
+        painter.drawRoundedRect(tooth, 0.7, 0.7)
+        painter.rotate(45)
+    painter.drawEllipse(QPointF(0, 0), size * 0.24, size * 0.24)
+    painter.drawEllipse(QPointF(0, 0), size * 0.11, size * 0.11)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def program_profile_directory() -> Path:
@@ -1100,8 +1121,15 @@ class MainWindow(QMainWindow):
         self.heading = QLabel(tr("window_title"))
         self.heading.setObjectName("title")
         self.heading.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.settings_button = QPushButton(tr("settings"))
+        self.settings_button = QPushButton()
         self.settings_button.setObjectName("settingsButton")
+        self.settings_button.setText("")
+        self.settings_button.setIcon(_gear_icon())
+        self.settings_button.setIconSize(QSize(18, 18))
+        self.settings_button.setFixedSize(36, 32)
+        self.settings_button.setToolTip(tr("settings"))
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.settings_button.clicked.connect(self._open_settings)
         self.minimize_button = self._chrome_button("windowButton", "–", tr("window_minimize"))
         self.maximize_button = self._chrome_button("windowButton", "□", tr("window_maximize"))
@@ -1538,7 +1566,9 @@ class MainWindow(QMainWindow):
         current = self.stack.currentIndex()
         self.setWindowTitle(tr("window_title"))
         self.heading.setText(tr("window_title"))
-        self.settings_button.setText(tr("settings"))
+        self.settings_button.setText("")
+        self.settings_button.setToolTip(tr("settings"))
+        self.settings_button.setIcon(_gear_icon())
         self.minimize_button.setToolTip(tr("window_minimize"))
         self.close_button.setToolTip(tr("window_close"))
         self._sync_maximize_button()

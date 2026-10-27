@@ -153,8 +153,14 @@ class SettingsWindowTests(unittest.TestCase):
                 window.show()
                 try:
                     self.assertEqual(window.windowTitle(), "Словарь Preply в Anki")
-                    self.assertEqual(window.settings_button.text(), "Настройки")
+                    self.assertEqual(window.settings_button.text(), "")
+                    self.assertEqual(window.settings_button.objectName(), "settingsButton")
+                    self.assertEqual(window.settings_button.toolTip(), "Настройки")
+                    self.assertFalse(window.settings_button.icon().isNull())
                     self.assertFalse(window.stack.isAncestorOf(window.settings_button))
+                    with patch.object(SettingsDialog, "exec", return_value=QDialog.DialogCode.Rejected) as opened:
+                        window.settings_button.click()
+                    opened.assert_called_once()
                     for index in range(window.stack.count()):
                         window._show_step(index)
                         self.assertTrue(window.settings_button.isVisible())
@@ -172,7 +178,8 @@ class SettingsWindowTests(unittest.TestCase):
                     dialog.cancel_button.click()
                     self.assertEqual(dialog.result(), QDialog.DialogCode.Rejected)
                     self.assertEqual(load_settings(path), AppSettings())
-                    self.assertEqual(window.settings_button.text(), "Настройки")
+                    self.assertEqual(window.settings_button.text(), "")
+                    self.assertEqual(window.settings_button.toolTip(), "Настройки")
 
                     dialog = SettingsDialog(window, AppSettings())
                     dialog.en_radio.setChecked(True)
@@ -183,7 +190,8 @@ class SettingsWindowTests(unittest.TestCase):
                     window._commit_settings(dialog.chosen())
                     self.assertEqual(load_settings(path), AppSettings("en", str(folder)))
                     self.assertEqual(window.windowTitle(), "Preply vocabulary to Anki")
-                    self.assertEqual(window.settings_button.text(), "Settings")
+                    self.assertEqual(window.settings_button.text(), "")
+                    self.assertEqual(window.settings_button.toolTip(), "Settings")
                     self.assertEqual(window.login_panel.authorize_button.text(), "Authorize on Preply")
                     self.assertIn("Components", window.step_labels[0].text())
                     self.assertIn("Sign in", window.step_labels[1].text())
