@@ -23,7 +23,6 @@ from preply_extractor.gui import (
     MainWindow,
     SavePanel,
     WordListPanel,
-    default_save_folder,
     russian_error,
 )
 from preply_extractor.gui_logic import BrowserInstallError
@@ -107,18 +106,19 @@ class SaveFolderTests(unittest.TestCase):
     def tearDown(self) -> None:
         set_language("ru")
 
-    def test_unset_or_missing_folder_keeps_the_current_default(self) -> None:
+    def test_unset_folder_stays_empty_and_a_missing_path_is_shown(self) -> None:
         panel = SavePanel()
         try:
-            fallback = str(default_save_folder())
-            self.assertEqual(panel.folder_edit.text(), fallback)
+            self.assertEqual(panel.folder_edit.text(), "")
+            self.assertIn("не задана", panel.default_caption.text())
             panel.apply_default_folder("")
-            self.assertEqual(panel.folder_edit.text(), fallback)
+            self.assertEqual(panel.folder_edit.text(), "")
+            self.assertIn("не задана", panel.default_caption.text())
             missing = Path(tempfile.gettempdir()) / "preply-settings-missing-folder"
             self.assertFalse(missing.exists())
             panel.apply_default_folder(str(missing))
-            self.assertFalse(missing.exists())
-            self.assertEqual(panel.folder_edit.text(), fallback)
+            self.assertEqual(panel.folder_edit.text(), str(missing))
+            self.assertIn(str(missing), panel.default_caption.text())
         finally:
             panel.close()
 
@@ -198,7 +198,8 @@ class SettingsWindowTests(unittest.TestCase):
                     save_settings(AppSettings("en", ""), path)
                     window._show_step(0)
                     window._show_step(window.stack.indexOf(window.save_panel))
-                    self.assertEqual(window.save_panel.folder_edit.text(), str(default_save_folder()))
+                    self.assertEqual(window.save_panel.folder_edit.text(), "")
+                    self.assertIn("not set", window.save_panel.default_caption.text())
                 finally:
                     window.close()
 

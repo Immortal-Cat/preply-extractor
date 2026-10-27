@@ -209,6 +209,19 @@ STRINGS: dict[str, dict[str, str]] = {
     "could_not_write": {"ru": "Не удалось записать файл.\n{error}", "en": "Could not write the file.\n{error}"},
     "deck_saved": {"ru": "Колода сохранена:\n{path}", "en": "Deck saved:\n{path}"},
     "save": {"ru": "Сохранить", "en": "Save"},
+    "save_as": {"ru": "Сохранить как", "en": "Save as"},
+    "default_folder_path": {
+        "ru": "Папка по умолчанию: {path}",
+        "en": "Default folder: {path}",
+    },
+    "default_folder_unset": {
+        "ru": "Папка по умолчанию не задана.",
+        "en": "The default folder is not set.",
+    },
+    "default_folder_missing": {
+        "ru": "Папка по умолчанию не задана. Укажите её в настройках или нажмите «Сохранить как».",
+        "en": "The default folder is not set. Choose it in Settings or click Save as.",
+    },
     "start_again": {"ru": "Начать заново", "en": "Start again"},
     "deck_ready_partial": {
         "ru": "Колода собрана: {total} слов. Аудио скачано: {ready}. Не скачалось: {missed} ({names}{extra}). Эти слова всё равно в колоде.",

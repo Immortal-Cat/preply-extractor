@@ -100,52 +100,131 @@ class SavePathTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             join_deck_path(folder, "bad/name")
 
-    def test_save_button_stays_enabled_and_saves_again(self) -> None:
+    def test_save_uses_the_settings_folder_and_save_as_uses_the_picker(self) -> None:
         from PySide6.QtWidgets import QMessageBox
 
-        from preply_extractor.gui import SavePanel
+        from preply_extractor.app_settings import AppSettings, load_settings, save_settings
+        from preply_extractor.gui import MainWindow
 
         _app()
-        panel = SavePanel()
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                folder = Path(tmp) / "decks"
-                built = Path(tmp) / "built.apkg"
-                built.write_bytes(b"first-bytes")
-                panel.set_result(built, [], 1)
-                panel.folder_edit.setText(str(folder))
-                panel.name_edit.setText("Deck")
-                panel._save()
-                first = folder / "Deck.apkg"
-                self.assertEqual(first.read_bytes(), b"first-bytes")
-                self.assertTrue(built.is_file())
-                self.assertTrue(panel.save_button.isEnabled())
-                self.assertIn(str(first), panel.success.text())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = root / "settings.json"
+            default_dir = root / "default-decks"
+            picked_dir = root / "picked-decks"
+            newer = root / "newer-default"
+            default_dir.mkdir()
+            picked_dir.mkdir()
+            newer.mkdir()
+            save_settings(AppSettings("ru", str(default_dir)), settings)
+            built = root / "built.apkg"
+            built.write_bytes(b"first-bytes")
+            with patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None):
+                window = MainWindow(settings_file=settings)
+                try:
+                    panel = window.save_panel
+                    panel.set_result(built, [], 1)
+                    panel.name_edit.setText("Deck")
+                    window._show_step(window.stack.indexOf(panel))
+                    self.assertIn(str(default_dir), panel.default_caption.text())
+                    self.assertEqual(Path(panel.folder_edit.text()), default_dir)
 
-                panel.name_edit.setText("Other")
-                panel._save()
-                second = folder / "Other.apkg"
-                self.assertEqual(second.read_bytes(), b"first-bytes")
-                self.assertTrue(first.is_file())
-                self.assertTrue(panel.save_button.isEnabled())
-                self.assertIn(str(second), panel.success.text())
+                    with patch(
+                        "preply_extractor.gui.QFileDialog.getExistingDirectory",
+                        side_effect=AssertionError("picker"),
+                    ):
+                        panel.save_button.click()
+                    saved = default_dir / "Deck.apkg"
+                    self.assertEqual(saved.read_bytes(), b"first-bytes")
+                    self.assertTrue(built.is_file())
+                    self.assertTrue(panel.save_button.isEnabled())
+                    self.assertTrue(panel.save_as_button.isEnabled())
+                    self.assertIn(str(saved), panel.success.text())
 
-                built.write_bytes(b"replaced-bytes")
-                panel.name_edit.setText("Deck")
-                with patch("preply_extractor.gui.QMessageBox") as box:
-                    box.Icon = QMessageBox.Icon
-                    box.StandardButton = QMessageBox.StandardButton
-                    box.return_value.button.return_value = None
-                    box.return_value.exec.return_value = QMessageBox.StandardButton.No
-                    panel._save()
-                    self.assertEqual(first.read_bytes(), b"first-bytes")
-                    box.return_value.exec.return_value = QMessageBox.StandardButton.Yes
-                    panel._save()
-                    self.assertEqual(first.read_bytes(), b"replaced-bytes")
-                self.assertTrue(panel.save_button.isEnabled())
-                self.assertTrue(second.is_file())
-        finally:
-            panel.close()
+                    built.write_bytes(b"replaced-bytes")
+                    with (
+                        patch(
+                            "preply_extractor.gui.QFileDialog.getExistingDirectory",
+                            side_effect=AssertionError("picker"),
+                        ),
+                        patch("preply_extractor.gui.QMessageBox") as box,
+                    ):
+                        panel.save_button.click()
+                        box.assert_not_called()
+                    self.assertEqual(saved.read_bytes(), b"replaced-bytes")
+                    self.assertTrue(panel.save_button.isEnabled())
+                    self.assertTrue(panel.save_as_button.isEnabled())
+
+                    with patch(
+                        "preply_extractor.gui.QFileDialog.getExistingDirectory",
+                        return_value=str(picked_dir),
+                    ) as picker:
+                        panel.save_as_button.click()
+                    picker.assert_called_once()
+                    picked = picked_dir / "Deck.apkg"
+                    self.assertEqual(picked.read_bytes(), b"replaced-bytes")
+                    self.assertEqual(saved.read_bytes(), b"replaced-bytes")
+                    self.assertEqual(Path(panel.folder_edit.text()), default_dir)
+                    self.assertTrue(panel.save_button.isEnabled())
+                    self.assertTrue(panel.save_as_button.isEnabled())
+                    self.assertIn(str(picked), panel.success.text())
+
+                    built.write_bytes(b"third-bytes")
+                    with patch(
+                        "preply_extractor.gui.QFileDialog.getExistingDirectory",
+                        return_value=str(picked_dir),
+                    ):
+                        with patch("preply_extractor.gui.QMessageBox") as box:
+                            box.Icon = QMessageBox.Icon
+                            box.StandardButton = QMessageBox.StandardButton
+                            box.return_value.button.return_value = None
+                            box.return_value.exec.return_value = QMessageBox.StandardButton.No
+                            panel.save_as_button.click()
+                            self.assertEqual(picked.read_bytes(), b"replaced-bytes")
+                            box.return_value.exec.return_value = QMessageBox.StandardButton.Yes
+                            panel.save_as_button.click()
+                            self.assertEqual(picked.read_bytes(), b"third-bytes")
+                    self.assertTrue(panel.save_button.isEnabled())
+                    self.assertTrue(panel.save_as_button.isEnabled())
+
+                    dialog = window._make_settings_dialog(load_settings(settings))
+                    dialog.folder_edit.setText(str(newer))
+                    dialog.cancel_button.click()
+                    self.assertIn(str(default_dir), panel.default_caption.text())
+                    self.assertNotIn(str(newer), panel.default_caption.text())
+                    self.assertEqual(Path(panel.folder_edit.text()), default_dir)
+
+                    dialog = window._make_settings_dialog(load_settings(settings))
+                    dialog.folder_edit.setText(str(newer))
+                    dialog.ok_button.click()
+                    self.assertEqual(Path(panel.folder_edit.text()), newer)
+                    self.assertIn(str(newer), panel.default_caption.text())
+                    self.assertNotIn(str(default_dir), panel.default_caption.text())
+
+                    with patch(
+                        "preply_extractor.gui.QFileDialog.getExistingDirectory",
+                        side_effect=AssertionError("picker"),
+                    ):
+                        panel.save_button.click()
+                    self.assertEqual((newer / "Deck.apkg").read_bytes(), b"third-bytes")
+
+                    dialog = window._make_settings_dialog(load_settings(settings))
+                    dialog.folder_edit.setText("")
+                    dialog.ok_button.click()
+                    self.assertIn("не задана", panel.default_caption.text())
+                    with (
+                        patch(
+                            "preply_extractor.gui.QFileDialog.getExistingDirectory",
+                            side_effect=AssertionError("picker"),
+                        ),
+                        patch("preply_extractor.gui.QMessageBox") as box,
+                    ):
+                        panel.save_button.click()
+                        box.assert_not_called()
+                    self.assertIn("Сохранить как", panel.success.text())
+                    self.assertEqual((newer / "Deck.apkg").read_bytes(), b"third-bytes")
+                finally:
+                    window.close()
 
 
 class ChromiumInstallTests(unittest.TestCase):

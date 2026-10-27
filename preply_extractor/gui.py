@@ -784,7 +784,8 @@ class BuildPanel(QWidget):
 class SavePanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self._folder = default_save_folder()
+        self._folder: Path | None = None
+        self._default_dir = ""
         self._temp_path: Path | None = None
         self._failures: list[AudioFailure] = []
         self._saved = False
@@ -804,12 +805,9 @@ class SavePanel(QWidget):
         folder_row = QHBoxLayout()
         self.folder_label = QLabel(tr("folder"))
         folder_row.addWidget(self.folder_label)
-        self.folder_edit = QLineEdit(str(self._folder))
+        self.folder_edit = QLineEdit("")
         self.folder_edit.setReadOnly(True)
-        self.browse_button = QPushButton(tr("browse"))
-        self.browse_button.clicked.connect(lambda _checked=False: self._browse())
         folder_row.addWidget(self.folder_edit, 1)
-        folder_row.addWidget(self.browse_button)
         layout.addLayout(folder_row)
 
         name_row = QHBoxLayout()
@@ -839,11 +837,19 @@ class SavePanel(QWidget):
         self.save_button = QPushButton(tr("save"))
         self.save_button.setObjectName("primary")
         self.save_button.clicked.connect(lambda _checked=False: self._save())
+        self.save_as_button = QPushButton(tr("save_as"))
+        self.save_as_button.clicked.connect(lambda _checked=False: self._save_as())
+        self.default_caption = QLabel("")
+        self.default_caption.setObjectName("detail")
+        self.default_caption.setWordWrap(True)
+        self.default_caption.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         buttons.addWidget(self.back_button)
         buttons.addStretch(1)
         buttons.addWidget(self.restart_button)
         buttons.addWidget(self.save_button)
+        buttons.addWidget(self.save_as_button)
         layout.addStretch(1)
+        layout.addWidget(self.default_caption)
         layout.addLayout(buttons)
         self._refresh_preview()
 
@@ -863,12 +869,10 @@ class SavePanel(QWidget):
         return self._saved
 
     def apply_default_folder(self, stored: str) -> None:
-        """Use the saved folder when it still exists. Otherwise keep today's default."""
-        if self._saved:
-            return
-        chosen = existing_directory(stored)
-        self._folder = chosen if chosen is not None else default_save_folder()
-        self.folder_edit.setText(str(self._folder))
+        """Preview the settings folder. Save uses it even after a deck was already saved."""
+        self._default_dir = stored.strip() if isinstance(stored, str) else ""
+        self._folder = existing_directory(self._default_dir)
+        self.folder_edit.setText(str(self._folder) if self._folder is not None else self._default_dir)
         self._refresh_preview()
 
     def _render_summary(self) -> None:
@@ -896,11 +900,11 @@ class SavePanel(QWidget):
     def retranslate(self) -> None:
         self.title.setText(tr("save_title"))
         self.folder_label.setText(tr("folder"))
-        self.browse_button.setText(tr("browse"))
         self.name_label.setText(tr("file_name"))
         self.back_button.setText(tr("back_to_words"))
         self.restart_button.setText(tr("start_again"))
         self.save_button.setText(tr("save"))
+        self.save_as_button.setText(tr("save_as"))
         self._render_summary()
         if self._saved and self._saved_path is not None:
             self.success.setText(tr("deck_saved", path=self._saved_path))
@@ -923,50 +927,58 @@ class SavePanel(QWidget):
         self.name_edit.setEnabled(True)
         self._refresh_preview()
 
-    def _browse(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, tr("choose_deck_folder"), str(self._folder))
-        if not chosen:
-            return
-        self._folder = Path(chosen)
-        self.folder_edit.setText(str(self._folder))
-        self._refresh_preview()
+    def _render_default_caption(self) -> None:
+        if self._default_dir:
+            self.default_caption.setText(tr("default_folder_path", path=self._default_dir))
+        else:
+            self.default_caption.setText(tr("default_folder_unset"))
 
     def _refresh_preview(self) -> None:
+        self._render_default_caption()
+        ready = self._temp_path is not None
+        self.save_button.setEnabled(ready)
+        self.save_as_button.setEnabled(ready)
+        folder = self._folder
+        if folder is None:
+            self.preview.setText(tr("default_folder_missing"))
+            return
         try:
-            path = join_deck_path(self.folder_edit.text(), self.name_edit.text())
+            path = join_deck_path(folder, self.name_edit.text())
         except ValueError:
             self.preview.setText(tr("enter_file_name_hint"))
-            self.save_button.setEnabled(False)
             return
         self.preview.setText(tr("file_will_be_saved", path=path))
-        self.save_button.setEnabled(self._temp_path is not None)
 
-    def _save(self) -> None:
+    def _require_built_deck(self) -> bool:
         if self._temp_path is None or not self._temp_path.is_file():
             QMessageBox.warning(self, tr("no_file_title"), tr("deck_not_built"))
+            return False
+        return True
+
+    def _named_destination(self, folder: Path | str) -> Path:
+        return join_deck_path(folder, self.name_edit.text())
+
+    def _confirm_replace(self, destination: Path) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(tr("file_exists_title"))
+        box.setText(tr("replace_file", path=destination))
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        yes_button = box.button(QMessageBox.StandardButton.Yes)
+        no_button = box.button(QMessageBox.StandardButton.No)
+        if yes_button is not None:
+            yes_button.setText(tr("replace"))
+        if no_button is not None:
+            no_button.setText(tr("cancel"))
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _write_copy(self, destination: Path) -> None:
+        source = self._temp_path
+        if source is None:
             return
-        try:
-            destination = join_deck_path(self.folder_edit.text(), self.name_edit.text())
-        except ValueError:
-            QMessageBox.warning(self, tr("file_name"), tr("enter_file_name"))
-            return
-        if destination.exists():
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Question)
-            box.setWindowTitle(tr("file_exists_title"))
-            box.setText(tr("replace_file", path=destination))
-            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            yes_button = box.button(QMessageBox.StandardButton.Yes)
-            no_button = box.button(QMessageBox.StandardButton.No)
-            if yes_button is not None:
-                yes_button.setText(tr("replace"))
-            if no_button is not None:
-                no_button.setText(tr("cancel"))
-            if box.exec() != QMessageBox.StandardButton.Yes:
-                return
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(self._temp_path, destination)
+            shutil.copy2(source, destination)
             failure_path = destination.with_suffix(".failures.json")
             failure_path.write_text(
                 json.dumps([item.to_dict() for item in self._failures], ensure_ascii=False, indent=2),
@@ -982,6 +994,41 @@ class SavePanel(QWidget):
         self.restart_button.setEnabled(True)
         self.restart_button.show()
         self._refresh_preview()
+
+    def _save(self) -> None:
+        if not self._require_built_deck():
+            return
+        folder = existing_directory(self._default_dir)
+        if folder is None:
+            self.success.setText(tr("default_folder_missing"))
+            return
+        try:
+            destination = self._named_destination(folder)
+        except ValueError:
+            QMessageBox.warning(self, tr("file_name"), tr("enter_file_name"))
+            return
+        self._write_copy(destination)
+
+    def _save_as(self) -> None:
+        if not self._require_built_deck():
+            return
+        try:
+            self._named_destination(self._default_dir or ".")
+        except ValueError:
+            QMessageBox.warning(self, tr("file_name"), tr("enter_file_name"))
+            return
+        start = str(self._folder) if self._folder is not None else str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, tr("choose_deck_folder"), start)
+        if not chosen:
+            return
+        try:
+            destination = self._named_destination(chosen)
+        except ValueError:
+            QMessageBox.warning(self, tr("file_name"), tr("enter_file_name"))
+            return
+        if destination.exists() and not self._confirm_replace(destination):
+            return
+        self._write_copy(destination)
 
 
 class MainWindow(QMainWindow):
