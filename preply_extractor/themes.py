@@ -204,27 +204,21 @@ QPushButton#primary:disabled {
     background: __BORDER__;
     color: __MUTED__;
 }
-QPushButton#windowButton, QPushButton#closeButton {
+QPushButton#windowButton, QPushButton#closeButton, QPushButton#settingsButton {
     background: transparent;
     color: __TEXT__;
     border: none;
     border-radius: 6px;
     padding: 0;
-    min-height: 28px;
+    margin: 0;
     min-width: 36px;
+    max-width: 36px;
+    min-height: 32px;
+    max-height: 32px;
     font-size: 14px;
 }
-QPushButton#windowButton:hover { background: __SURFACE__; }
+QPushButton#windowButton:hover, QPushButton#settingsButton:hover { background: __SURFACE__; }
 QPushButton#closeButton:hover { background: #be123c; color: #ffffff; }
-QPushButton#settingsButton {
-    background: transparent;
-    border: none;
-    border-radius: 6px;
-    padding: 0;
-    min-height: 28px;
-    min-width: 36px;
-}
-QPushButton#settingsButton:hover { background: __SURFACE__; }
 QRadioButton {
     color: __TEXT__;
     background: transparent;

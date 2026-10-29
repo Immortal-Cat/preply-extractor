@@ -193,7 +193,7 @@ class ThemeDialogTests(unittest.TestCase):
                     self.assertEqual(window._theme, "navy")
                     self.assertEqual(window.windowTitle(), "Словарь Preply в Anki")
                     self.assertEqual(window.settings_button.text(), "")
-                    self.assertEqual(window.settings_button.toolTip(), "Настройки")
+                    self.assertEqual(window.settings_button.toolTip(), "")
                     self.assertIn(_NAVY_ACCENT, QApplication.instance().styleSheet())
                     self.assertIn(_NAVY_BACKGROUND, QApplication.instance().styleSheet())
                 finally:

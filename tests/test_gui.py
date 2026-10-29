@@ -1857,6 +1857,19 @@ class FramelessWindowTests(unittest.TestCase):
                     self.assertTrue(window.minimize_button.isVisible())
                     self.assertTrue(window.maximize_button.isVisible())
                     self.assertTrue(window.close_button.isVisible())
+                    self.assertEqual(window.settings_button.objectName(), "settingsButton")
+                    header_buttons = (
+                        window.settings_button,
+                        window.minimize_button,
+                        window.maximize_button,
+                        window.close_button,
+                    )
+                    shared = header_buttons[0].size()
+                    self.assertEqual(shared.width(), 36)
+                    self.assertEqual(shared.height(), 32)
+                    for button in header_buttons:
+                        self.assertEqual(button.size(), shared)
+                        self.assertEqual(button.toolTip(), "")
 
                     window.move(80, 60)
                     local = QPointF(12, 10)
@@ -1884,7 +1897,7 @@ class FramelessWindowTests(unittest.TestCase):
 
                     window.maximize_button.click()
                     self.assertTrue(window.isMaximized())
-                    self.assertEqual(window.maximize_button.toolTip(), "Восстановить")
+                    self.assertEqual(window.maximize_button.toolTip(), "")
                     self.assertEqual(window.maximize_button.text(), "❐")
                     window.maximize_button.click()
                     self.assertFalse(window.isMaximized())

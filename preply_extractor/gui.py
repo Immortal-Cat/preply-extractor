@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -84,23 +84,30 @@ from preply_extractor.words import VocabWord
 PROFILE_DIR = Path(".preply-profile")
 
 
-def _gear_icon(color: str = "#2dd4bf", size: int = 18) -> QIcon:
-    """A small turquoise gear for the navy header. Not a text label."""
+_HEADER_BUTTON = QSize(36, 32)
+
+
+def _gear_icon(color: str = "#ffffff", size: int = 15) -> QIcon:
+    """White outline gear, the same weight as the window glyphs."""
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     pen = QPen(QColor(color))
-    pen.setWidthF(1.6)
+    pen.setWidthF(1.35)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.translate(size / 2, size / 2)
-    tooth = QRectF(-1.35, -(size * 0.46), 2.7, size * 0.16)
+    ring = size * 0.22
+    painter.drawEllipse(QPointF(0, 0), ring, ring)
+    painter.drawEllipse(QPointF(0, 0), size * 0.09, size * 0.09)
+    tooth_inner = ring + 1.1
+    tooth_outer = size * 0.46
     for _tooth in range(8):
-        painter.drawRoundedRect(tooth, 0.7, 0.7)
+        painter.drawLine(QPointF(0, -tooth_inner), QPointF(0, -tooth_outer))
         painter.rotate(45)
-    painter.drawEllipse(QPointF(0, 0), size * 0.24, size * 0.24)
-    painter.drawEllipse(QPointF(0, 0), size * 0.11, size * 0.11)
     painter.end()
     return QIcon(pixmap)
 
@@ -1125,15 +1132,15 @@ class MainWindow(QMainWindow):
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.setText("")
         self.settings_button.setIcon(_gear_icon())
-        self.settings_button.setIconSize(QSize(18, 18))
-        self.settings_button.setFixedSize(36, 32)
-        self.settings_button.setToolTip(tr("settings"))
+        self.settings_button.setIconSize(QSize(15, 15))
+        self.settings_button.setFixedSize(_HEADER_BUTTON)
+        self.settings_button.setToolTip("")
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.settings_button.clicked.connect(self._open_settings)
-        self.minimize_button = self._chrome_button("windowButton", "–", tr("window_minimize"))
-        self.maximize_button = self._chrome_button("windowButton", "□", tr("window_maximize"))
-        self.close_button = self._chrome_button("closeButton", "✕", tr("window_close"))
+        self.minimize_button = self._chrome_button("windowButton", "–")
+        self.maximize_button = self._chrome_button("windowButton", "□")
+        self.close_button = self._chrome_button("closeButton", "✕")
         self.minimize_button.clicked.connect(self.showMinimized)
         self.maximize_button.clicked.connect(self._toggle_maximized)
         self.close_button.clicked.connect(self.close)
@@ -1567,10 +1574,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(tr("window_title"))
         self.heading.setText(tr("window_title"))
         self.settings_button.setText("")
-        self.settings_button.setToolTip(tr("settings"))
+        self.settings_button.setToolTip("")
         self.settings_button.setIcon(_gear_icon())
-        self.minimize_button.setToolTip(tr("window_minimize"))
-        self.close_button.setToolTip(tr("window_close"))
+        self.minimize_button.setToolTip("")
+        self.maximize_button.setToolTip("")
+        self.close_button.setToolTip("")
         self._sync_maximize_button()
         self._rebuild_steps()
         self.deps_panel.retranslate()
@@ -1585,11 +1593,11 @@ class MainWindow(QMainWindow):
         self._set_connection(self._status_state, phrase_text(self._status_phrase))
         self._show_step(current)
 
-    def _chrome_button(self, object_name: str, glyph: str, tip: str) -> QPushButton:
+    def _chrome_button(self, object_name: str, glyph: str) -> QPushButton:
         button = QPushButton(glyph)
         button.setObjectName(object_name)
-        button.setToolTip(tip)
-        button.setFixedSize(36, 32)
+        button.setToolTip("")
+        button.setFixedSize(_HEADER_BUTTON)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setAutoDefault(False)
@@ -1605,10 +1613,9 @@ class MainWindow(QMainWindow):
     def _sync_maximize_button(self) -> None:
         if self.isMaximized():
             self.maximize_button.setText("❐")
-            self.maximize_button.setToolTip(tr("window_restore"))
         else:
             self.maximize_button.setText("□")
-            self.maximize_button.setToolTip(tr("window_maximize"))
+        self.maximize_button.setToolTip("")
 
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
