@@ -1845,6 +1845,21 @@ class ChromeProfileTests(unittest.TestCase):
 
 
 class WindowMotionTests(unittest.TestCase):
+    def test_app_user_model_id_is_set(self) -> None:
+        import ctypes
+
+        from preply_extractor.gui import _APP_USER_MODEL_ID, _set_app_user_model_id
+
+        if sys.platform != "win32":
+            self.skipTest("Windows taskbar identity")
+        _set_app_user_model_id()
+        shell32 = ctypes.windll.shell32
+        shell32.GetCurrentProcessExplicitAppUserModelID.argtypes = [ctypes.POINTER(ctypes.c_wchar_p)]
+        shell32.GetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+        buffer = ctypes.c_wchar_p()
+        self.assertEqual(shell32.GetCurrentProcessExplicitAppUserModelID(ctypes.byref(buffer)), 0)
+        self.assertEqual(buffer.value, _APP_USER_MODEL_ID)
+
     def test_saved_normal_rect_and_maximize_target(self) -> None:
         from PySide6.QtCore import QRect
 
@@ -1897,18 +1912,30 @@ class WindowMotionTests(unittest.TestCase):
                     window._motion.remember_normal()
                     window._motion._dock_rect = lambda: QRect(dock)
                     window.minimize_button.click()
+                    self.assertEqual(window._motion.mode, "minimize")
+                    self.assertIsNotNone(window._motion._snapshot)
                     self.assertEqual(window.geometry(), normal)
                     self.assertNotEqual(window.geometry(), dock)
+                    self.assertEqual(window._motion._animation.animationAt(0).endValue(), dock)
                     QTest.qWait(MOTION_MS + 120)
+                    self.assertIsNone(window._motion._snapshot)
+                    self.assertIsNone(window._motion.mode)
                     self.assertEqual(window._motion.normal_rect(), normal)
                     self.assertNotEqual(window._motion.normal_rect(), dock)
                     self.assertNotEqual(window.geometry(), dock)
                     self.assertEqual(window.geometry().size(), normal.size())
                     window._motion.restore_from_shell()
+                    self.assertEqual(window._motion.mode, "restore-min")
+                    self.assertIsNotNone(window._motion._snapshot)
+                    restore = window._motion._animation.animationAt(0)
+                    self.assertEqual(restore.startValue(), dock)
+                    self.assertEqual(restore.endValue(), normal)
+                    self.assertEqual(window.geometry().size(), normal.size())
+                    QTest.qWait(MOTION_MS + 150)
+                    self.assertIsNone(window._motion._snapshot)
                     self.assertFalse(window.isMinimized())
                     self.assertEqual(window.geometry(), normal)
                     self.assertEqual(window.windowOpacity(), 1.0)
-                    self.assertIsNone(window._motion._snapshot)
                 finally:
                     window.close()
 
@@ -1943,10 +1970,16 @@ class WindowMotionTests(unittest.TestCase):
                     self.assertTrue(window._handle_shell_command(_SC_RESTORE))
                     self.assertEqual(window._motion.mode, "minimize")
                     QTest.qWait(MOTION_MS + 150)
+                    self.assertIsNone(window._motion._snapshot)
                     self.assertEqual(window._motion.normal_rect(), normal)
                     self.assertNotEqual(window.geometry(), button)
                     self.assertEqual(window.geometry().size(), normal.size())
                     self.assertTrue(window._handle_shell_command(_SC_RESTORE))
+                    self.assertEqual(window._motion.mode, "restore-min")
+                    self.assertTrue(window._handle_shell_command(_SC_MINIMIZE))
+                    self.assertEqual(window._motion.mode, "restore-min")
+                    QTest.qWait(MOTION_MS + 150)
+                    self.assertIsNone(window._motion._snapshot)
                     self.assertFalse(window.isMinimized())
                     self.assertEqual(window.geometry(), normal)
                     self.assertEqual(window.windowOpacity(), 1.0)
@@ -2003,6 +2036,7 @@ class FramelessWindowTests(unittest.TestCase):
                 try:
                     self.assertTrue(bool(window.windowFlags() & Qt.WindowType.FramelessWindowHint))
                     self.assertEqual(window.windowTitle(), "Словарь Preply в Anki")
+                    self.assertFalse(window.windowIcon().isNull())
                     self.assertTrue(window.minimize_button.isVisible())
                     self.assertTrue(window.maximize_button.isVisible())
                     self.assertTrue(window.close_button.isVisible())

@@ -272,6 +272,10 @@ _WM_SYSCOMMAND = 0x0112
 _SC_RESTORE = 0xF120
 _SC_MINIMIZE = 0xF020
 _APP_USER_MODEL_ID = "ImmortalCat.PreplyExtractor"
+_APP_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "preply_extractor.ico"
+_SHORTCUT_PATH = Path.home() / "Desktop" / "Preply Extractor.lnk"
+_last_taskbar_rule = ""
+_kept_icon_handles: list[int] = []
 _log = logging.getLogger(__name__)
 
 
@@ -295,6 +299,168 @@ class _Guid(ctypes.Structure):
         ("Data3", ctypes.c_ushort),
         ("Data4", ctypes.c_ubyte * 8),
     ]
+
+
+class _PropertyKey(ctypes.Structure):
+    _fields_ = [("fmtid", _Guid), ("pid", ctypes.c_ulong)]
+
+
+class _PropVariant(ctypes.Structure):
+    _fields_ = [
+        ("vt", ctypes.c_ushort),
+        ("r1", ctypes.c_ushort),
+        ("r2", ctypes.c_ushort),
+        ("r3", ctypes.c_ushort),
+        ("pszVal", ctypes.c_wchar_p),
+        ("pad", ctypes.c_ulonglong),
+    ]
+
+
+def _property_key(pid: int) -> _PropertyKey:
+    key = _PropertyKey()
+    key.fmtid = _Guid.from_buffer_copy(uuid.UUID("9f4c2855-9f79-4b39-a8d0-e1d42de1d5f3").bytes_le)
+    key.pid = pid
+    return key
+
+
+def _string_variant(text: str) -> tuple[_PropVariant, ctypes.Array]:
+    buffer = ctypes.create_unicode_buffer(text)
+    variant = _PropVariant()
+    variant.vt = 31
+    variant.pszVal = ctypes.cast(buffer, ctypes.c_wchar_p)
+    return variant, buffer
+
+
+def _apply_window_identity(window: QWidget) -> None:
+    """AppUserModelID and the program icon, before the taskbar button is created."""
+    _set_app_user_model_id()
+    icon = QIcon(str(_APP_ICON_PATH))
+    if not icon.isNull():
+        window.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+            app.setApplicationDisplayName(window.windowTitle())
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = int(window.winId())
+    except Exception:
+        return
+    _set_native_window_icon(hwnd)
+    _set_window_app_id(hwnd, window.windowTitle())
+
+
+def _set_native_window_icon(hwnd: int) -> None:
+    if not _APP_ICON_PATH.is_file():
+        return
+    user32 = ctypes.windll.user32
+    user32.LoadImageW.argtypes = [
+        wintypes.HINSTANCE,
+        wintypes.LPCWSTR,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.LoadImageW.restype = ctypes.c_void_p
+    user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    handle = user32.LoadImageW(None, str(_APP_ICON_PATH), 1, 0, 0, 0x0010 | 0x0040)
+    if not handle:
+        return
+    _kept_icon_handles.append(int(handle))
+    user32.SendMessageW(hwnd, 0x0080, 1, int(handle))
+    user32.SendMessageW(hwnd, 0x0080, 0, int(handle))
+
+
+def _set_window_app_id(hwnd: int, title: str) -> None:
+    shell32 = ctypes.windll.shell32
+    iid = _Guid.from_buffer_copy(uuid.UUID("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99").bytes_le)
+    store = ctypes.c_void_p()
+    shell32.SHGetPropertyStoreForWindow.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(_Guid),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long
+    if shell32.SHGetPropertyStoreForWindow(hwnd, ctypes.byref(iid), ctypes.byref(store)) != 0 or not store.value:
+        return
+    try:
+        table = ctypes.cast(ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+        set_value = ctypes.WINFUNCTYPE(
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.POINTER(_PropertyKey),
+            ctypes.POINTER(_PropVariant),
+        )(table[6])
+        commit = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(table[7])
+        kept: list = []
+        for pid, text in (
+            (5, _APP_USER_MODEL_ID),
+            (4, title),
+            (3, f"{_APP_ICON_PATH},0"),
+        ):
+            key = _property_key(pid)
+            variant, buffer = _string_variant(text)
+            kept.append((key, variant, buffer))
+            set_value(store, ctypes.byref(key), ctypes.byref(variant))
+        commit(store)
+    except Exception:
+        return
+    finally:
+        _com_release(store)
+
+
+def _ensure_shortcut_app_id() -> None:
+    """The Desktop shortcut must carry the same AppUserModelID or the taskbar stays 'Python'."""
+    if sys.platform != "win32" or not _SHORTCUT_PATH.is_file():
+        return
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    started = ole32.CoInitializeEx(None, 2)
+    link = ctypes.c_void_p()
+    store = ctypes.c_void_p()
+    try:
+        if started not in (0, 1):
+            return
+        clsid = _Guid.from_buffer_copy(uuid.UUID("00021401-0000-0000-c000-000000000046").bytes_le)
+        persist = _Guid.from_buffer_copy(uuid.UUID("0000010b-0000-0000-c000-000000000046").bytes_le)
+        store_iid = _Guid.from_buffer_copy(uuid.UUID("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99").bytes_le)
+        if ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(persist), ctypes.byref(link)) != 0:
+            return
+        if _com_call(link, 5, ctypes.c_long, [ctypes.c_wchar_p, ctypes.c_ulong], str(_SHORTCUT_PATH), 2) != 0:
+            return
+        if _com_call(
+            link,
+            0,
+            ctypes.c_long,
+            [ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.byref(store_iid),
+            ctypes.byref(store),
+        ) != 0:
+            return
+        key = _property_key(5)
+        variant, buffer = _string_variant(_APP_USER_MODEL_ID)
+        _com_call(
+            store,
+            6,
+            ctypes.c_long,
+            [ctypes.POINTER(_PropertyKey), ctypes.POINTER(_PropVariant)],
+            ctypes.byref(key),
+            ctypes.byref(variant),
+        )
+        _com_call(store, 7, ctypes.c_long, [])
+        _com_call(link, 6, ctypes.c_long, [ctypes.c_wchar_p, ctypes.c_int], str(_SHORTCUT_PATH), 1)
+        del buffer
+    except Exception:
+        return
+    finally:
+        _com_release(store)
+        _com_release(link)
+        if started in (0, 1):
+            ole32.CoUninitialize()
 
 
 class _Variant(ctypes.Structure):
@@ -373,6 +539,8 @@ def find_taskbar_button_rect(hwnd: int, title: str) -> QRect | None:
 
 
 def _uia_taskbar_button(hwnd: int, title: str) -> QRect | None:
+    global _last_taskbar_rule
+    _last_taskbar_rule = ""
     ole32 = ctypes.windll.ole32
     user32 = ctypes.windll.user32
     ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
@@ -409,7 +577,7 @@ def _uia_taskbar_button(hwnd: int, title: str) -> QRect | None:
                 break
             trays.append(extra)
             previous = extra
-        matches: list[tuple[int, QRect]] = []
+        matches: list[tuple[int, QRect, str]] = []
         for tray in trays:
             element = _uia_element_from_handle(automation, tray)
             if not element or not element.value:
@@ -427,6 +595,7 @@ def _uia_taskbar_button(hwnd: int, title: str) -> QRect | None:
         if not matches:
             return None
         matches.sort(key=lambda item: item[0])
+        _last_taskbar_rule = matches[0][2]
         return QRect(matches[0][1])
     finally:
         _com_release(automation)
@@ -560,8 +729,8 @@ def _uia_property_string(element, prop_id: int) -> str:
         _clear_variant(value)
 
 
-def _uia_matching_buttons(buttons: list, hwnd: int, title: str) -> list[tuple[int, QRect]]:
-    matches: list[tuple[int, QRect]] = []
+def _uia_matching_buttons(buttons: list, hwnd: int, title: str) -> list[tuple[int, QRect, str]]:
+    matches: list[tuple[int, QRect, str]] = []
     app_id = _APP_USER_MODEL_ID.casefold()
     try:
         for item in buttons:
@@ -569,15 +738,21 @@ def _uia_matching_buttons(buttons: list, hwnd: int, title: str) -> list[tuple[in
             automation_id = _uia_property_string(item, 30011)
             native = _uia_native_hwnd(item)
             bounds = _uia_bounds(item)
-            if bounds.width() <= 0 or bounds.height() <= 0 or bounds.height() > 240:
+            if bounds.width() <= 0 or bounds.height() <= 0 or bounds.width() > 220 or bounds.height() > 160:
                 continue
             by_handle = bool(hwnd and native and int(native) == int(hwnd))
             by_title = _taskbar_name_matches(name, title)
             by_app = app_id in automation_id.casefold()
             if not (by_handle or by_title or by_app):
                 continue
+            if by_handle:
+                rule = "hwnd"
+            elif by_title:
+                rule = "title"
+            else:
+                rule = "appid"
             rank = 0 if by_handle else _taskbar_name_rank(name) if by_title else 3
-            matches.append((rank, bounds))
+            matches.append((rank, bounds, rule))
     finally:
         for item in buttons:
             _com_release(item)
@@ -1660,6 +1835,10 @@ class WindowMotion:
         self._dragging = False
         self._shell_restore = False
         self._concealed = False
+        self._cloaked = False
+        self._revealing = False
+        self._flight_pixmap: QPixmap | None = None
+        self._last_dock: QRect | None = None
         self.mode: str | None = None
 
     def note_drag(self, active: bool) -> None:
@@ -1679,6 +1858,7 @@ class WindowMotion:
             animation.stop()
             animation.deleteLater()
         self._drop_snapshot()
+        self._uncloak()
         self._window.setWindowOpacity(1.0)
         if not concealed or reveal == "none":
             return
@@ -1714,8 +1894,9 @@ class WindowMotion:
         )
         found = button is not None
         _log.info(
-            "taskbar button found=%s rect=%s",
+            "taskbar button found=%s rule=%s rect=%s",
             found,
+            _last_taskbar_rule or "none",
             None if button is None else (button.x(), button.y(), button.width(), button.height()),
         )
         target = taskbar_target_rect(button, taskbar_bar_rect(ratio))
@@ -1738,18 +1919,52 @@ class WindowMotion:
             return
         self._capture_if_idle()
         self.stop(reveal="none")
-        if not self._window.isVisible():
+        if not self._window.isVisible() and not self._window.isMinimized():
             self._reveal_normal()
         start = QRect(self._window.geometry())
-        self._show_snapshot(start)
-        self._place_normal()
-        self._conceal()
+        dock = self._dock_rect()
+        self._last_dock = QRect(dock)
+        pixmap = QPixmap(self._window.grab())
+        self._flight_pixmap = pixmap
+        snapshot = self._make_snapshot(pixmap, start)
+        self._conceal_for_flight()
+        self._present_snapshot(snapshot)
         self.mode = "minimize"
-        self._animate(self._snapshot, start, self._dock_rect(), self._after_minimize)
+        self._animate(snapshot, start, dock, self._after_minimize)
 
-    def _conceal(self) -> None:
+    def _cloak(self, cloaked: bool) -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            hwnd = int(self._window.winId())
+            value = ctypes.c_int(1 if cloaked else 0)
+            dwmapi = ctypes.windll.dwmapi
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            return dwmapi.DwmSetWindowAttribute(hwnd, 13, ctypes.byref(value), ctypes.sizeof(value)) == 0
+        except Exception:
+            return False
+
+    def _uncloak(self) -> None:
+        if self._cloaked:
+            self._cloak(False)
+            self._cloaked = False
+
+    def _conceal_for_flight(self) -> None:
+        """Hide the real window without removing its taskbar button, when Windows allows it."""
+        if self._cloak(True):
+            self._cloaked = True
+            return
         self._concealed = True
         self._window.hide()
+
+    def _conceal(self) -> None:
+        self._conceal_for_flight()
 
     def _place_normal(self) -> None:
         self._window.setGeometry(self.normal_rect())
@@ -1757,40 +1972,73 @@ class WindowMotion:
     def _reveal_normal(self) -> None:
         rect = self.normal_rect()
         self._concealed = False
-        self._window.setWindowOpacity(1.0)
-        self._window.showNormal()
-        self._window.setGeometry(rect)
-        self._window._sync_corners()
+        self._uncloak()
+        self._revealing = True
+        try:
+            self._window.setWindowOpacity(1.0)
+            self._window.showNormal()
+            self._window.setGeometry(rect)
+            self._window._sync_corners()
+        finally:
+            self._revealing = False
 
     def _reveal_minimized(self) -> None:
         self._place_normal()
-        self._concealed = False
-        self._window.setWindowOpacity(1.0)
-        self._window.showMinimized()
+        self._revealing = True
+        try:
+            self._window.showMinimized()
+            self._uncloak()
+            self._concealed = False
+            self._window.setWindowOpacity(1.0)
+        finally:
+            self._revealing = False
 
     def _after_minimize(self) -> None:
+        self._drop_snapshot()
         if self.mode != "minimize":
             return
         self.mode = None
         self._animation = None
         self._reveal_minimized()
-        self._drop_snapshot()
 
     def restore_minimized(self) -> None:
         self.restore_from_shell()
 
     def restore_from_shell(self) -> None:
-        """Taskbar click: previous size and position, full opacity, no dock rect, no snapshot."""
-        if self._shell_restore:
+        """Grow a snapshot from the taskbar button back to the saved geometry, then show the window once."""
+        if self._shell_restore or self.mode in ("minimize", "restore-min"):
             return
         self._shell_restore = True
         try:
             self.stop(reveal="none")
-            self._reveal_normal()
-            self._window.raise_()
-            self._window.activateWindow()
+            dock = self._dock_rect()
+            if dock.width() <= 0 and self._last_dock is not None:
+                dock = QRect(self._last_dock)
+            target = self.normal_rect()
+            pixmap = self._flight_pixmap
+            if pixmap is None or pixmap.isNull() or dock.width() <= 0:
+                self._reveal_normal()
+                self._window.raise_()
+                self._window.activateWindow()
+                self._window._restored_at = time.monotonic()
+                return
+            snapshot = self._make_snapshot(pixmap, dock)
+            self._present_snapshot(snapshot)
+            self.mode = "restore-min"
+            self._animate(snapshot, dock, target, self._after_restore_min)
         finally:
             self._shell_restore = False
+
+    def _after_restore_min(self) -> None:
+        self._drop_snapshot()
+        if self.mode != "restore-min":
+            return
+        self.mode = None
+        self._animation = None
+        self._reveal_normal()
+        self._window.raise_()
+        self._window.activateWindow()
+        self._window._restored_at = time.monotonic()
 
     def maximize(self) -> None:
         if self._dragging:
@@ -1805,21 +2053,27 @@ class WindowMotion:
         screen = self._window.screen()
         available = screen.availableGeometry() if screen is not None else QRect(self._window.geometry())
         start = QRect(self._window.geometry())
-        self._show_snapshot(start)
-        self._conceal()
+        snapshot = self._make_snapshot(self._window.grab(), start)
+        self._conceal_for_flight()
+        self._present_snapshot(snapshot)
         self.mode = "maximize"
-        self._animate(self._snapshot, start, maximize_geometry(available), self._after_maximize)
+        self._animate(snapshot, start, maximize_geometry(available), self._after_maximize)
 
     def _after_maximize(self) -> None:
+        self._drop_snapshot()
         if self.mode != "maximize":
             return
         self.mode = None
         self._animation = None
-        self._concealed = False
-        self._window.setWindowOpacity(1.0)
-        self._window.showMaximized()
-        self._window._sync_corners()
-        self._drop_snapshot()
+        self._revealing = True
+        try:
+            self._uncloak()
+            self._concealed = False
+            self._window.setWindowOpacity(1.0)
+            self._window.showMaximized()
+            self._window._sync_corners()
+        finally:
+            self._revealing = False
 
     def restore_maximized(self) -> None:
         self.stop(reveal="none")
@@ -1831,34 +2085,40 @@ class WindowMotion:
             return
         target = self.normal_rect()
         start = QRect(self._window.geometry())
-        self._show_snapshot(start)
-        self._conceal()
+        snapshot = self._make_snapshot(self._window.grab(), start)
+        self._conceal_for_flight()
+        self._present_snapshot(snapshot)
         self.mode = "restore-max"
-        self._animate(self._snapshot, start, target, self._after_restore_max)
+        self._animate(snapshot, start, target, self._after_restore_max)
 
     def _after_restore_max(self) -> None:
+        self._drop_snapshot()
         if self.mode != "restore-max":
             return
         self.mode = None
         self._animation = None
         self._reveal_normal()
-        self._drop_snapshot()
 
-    def _show_snapshot(self, rect: QRect) -> None:
+    def _make_snapshot(self, pixmap: QPixmap, rect: QRect) -> _MotionSnapshot:
         self._drop_snapshot()
-        snapshot = _MotionSnapshot(self._window.grab())
+        snapshot = _MotionSnapshot(pixmap)
         snapshot.setGeometry(rect)
+        return snapshot
+
+    def _present_snapshot(self, snapshot: _MotionSnapshot) -> None:
         snapshot.show()
         self._snapshot = snapshot
 
     def _drop_snapshot(self) -> None:
         snapshot = self._snapshot
         self._snapshot = None
-        if snapshot is not None:
-            snapshot.hide()
-            snapshot.deleteLater()
+        if snapshot is None:
+            return
+        snapshot.hide()
+        snapshot.close()
+        snapshot.deleteLater()
 
-    def _animate(self, target, start: QRect, end: QRect, on_done, opacity_end: float | None = None) -> None:
+    def _animate(self, target, start: QRect, end: QRect, on_done) -> None:
         if target is None:
             on_done()
             return
@@ -1869,13 +2129,6 @@ class WindowMotion:
         geometry.setEndValue(end)
         geometry.setEasingCurve(QEasingCurve.Type.OutCubic)
         group.addAnimation(geometry)
-        if opacity_end is not None:
-            fade = QPropertyAnimation(target, b"windowOpacity", group)
-            fade.setDuration(MOTION_MS)
-            fade.setStartValue(float(target.windowOpacity()))
-            fade.setEndValue(opacity_end)
-            fade.setEasingCurve(QEasingCurve.Type.OutCubic)
-            group.addAnimation(fade)
         group.finished.connect(on_done)
         self._animation = group
         group.start()
@@ -1934,6 +2187,7 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setWindowTitle(tr("window_title"))
+        _apply_window_identity(self)
         self.resize(920, 700)
         self.setMinimumSize(760, 560)
         self._temp_dir: Path | None = None
@@ -2482,6 +2736,7 @@ class MainWindow(QMainWindow):
             and event.oldState() & Qt.WindowState.WindowMinimized
             and not self.isMinimized()
             and hasattr(self, "_motion")
+            and not self._motion._revealing
         ):
             self._motion.restore_from_shell()
         if hasattr(self, "maximize_button"):
@@ -2492,18 +2747,19 @@ class MainWindow(QMainWindow):
         """Taskbar toggle. One click either minimizes or restores, never both."""
         command &= 0xFFF0
         if command == _SC_MINIMIZE:
-            if self.isMinimized() or self._motion.mode == "minimize":
+            if self._motion.mode in ("minimize", "restore-min"):
+                return True
+            if self.isMinimized():
                 return True
             if time.monotonic() - self._restored_at < 0.15:
                 return True
             self._motion.minimize()
             return True
         if command == _SC_RESTORE:
-            if self._motion.mode == "minimize":
+            if self._motion.mode in ("minimize", "restore-min"):
                 return True
-            if self.isVisible() and not self.isMinimized() and not self._motion._concealed:
+            if self.isVisible() and not self.isMinimized() and not self._motion._concealed and not self._motion._cloaked:
                 return True
-            self._restored_at = time.monotonic()
             self._motion.restore_from_shell()
             return True
         return False
@@ -2532,7 +2788,10 @@ class MainWindow(QMainWindow):
 
 def main(argv: list[str] | None = None) -> int:
     _set_app_user_model_id()
+    _ensure_shortcut_app_id()
     app = QApplication.instance() or QApplication(argv or sys.argv)
+    if _APP_ICON_PATH.is_file():
+        app.setWindowIcon(QIcon(str(_APP_ICON_PATH)))
     app.setFont(QFont("Segoe UI", 11))
     apply_theme(app, DEFAULT_THEME)
     window = MainWindow()
