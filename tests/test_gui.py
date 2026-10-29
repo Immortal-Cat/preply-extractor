@@ -2016,21 +2016,18 @@ class FramelessWindowTests(unittest.TestCase):
                     shared = header_buttons[0].size()
                     self.assertEqual(shared.width(), 36)
                     self.assertEqual(shared.height(), 32)
-                    from preply_extractor.gui import _SETTINGS_ICON_PATH
+                    import preply_extractor.gui as gui_module
 
-                    self.assertTrue(_SETTINGS_ICON_PATH.is_file())
+                    self.assertFalse(hasattr(gui_module, "_SETTINGS_ICON_PATH"))
+                    self.assertFalse(hasattr(gui_module, "_settings_icon"))
+                    self.assertFalse((Path(__file__).resolve().parent.parent / "assets" / "settings.png").is_file())
                     for button in header_buttons:
                         self.assertEqual(button.size(), shared)
                         self.assertEqual(button.toolTip(), "")
                         self.assertEqual(button.text(), "")
                         self.assertFalse(button.icon().isNull())
-                        if button is window.settings_button:
-                            self.assertLessEqual(button.iconSize().width(), shared.width())
-                            self.assertLessEqual(button.iconSize().height(), shared.height())
-                            self.assertGreater(button.iconSize().width(), 0)
-                        else:
-                            self.assertEqual(button.iconSize().width(), 16)
-                            self.assertEqual(button.iconSize().height(), 16)
+                        self.assertEqual(button.iconSize().width(), 16)
+                        self.assertEqual(button.iconSize().height(), 16)
                     with patch.object(window, "_open_settings") as open_settings:
                         window.settings_button.click()
                     open_settings.assert_called_once()

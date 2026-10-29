@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import math
 import queue
 import shutil
 import subprocess
@@ -29,7 +30,16 @@ from PySide6.QtCore import (
     QThread,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QWindowStateChangeEvent
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QWindowStateChangeEvent,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -103,7 +113,6 @@ from preply_extractor.ui_text import (
 from preply_extractor.words import VocabWord
 
 PROFILE_DIR = Path(".preply-profile")
-_SETTINGS_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "settings.png"
 
 
 _HEADER_BUTTON = QSize(36, 32)
@@ -139,24 +148,40 @@ def _chrome_icon(kind: str, color: str = "#ffffff", size: int = _ICON_PX) -> QIc
     elif kind == "close":
         painter.drawLine(box.topLeft(), box.bottomRight())
         painter.drawLine(box.topRight(), box.bottomLeft())
+    elif kind == "settings":
+        _paint_gear(painter, size)
     painter.end()
     return QIcon(pixmap)
 
 
-def _settings_icon() -> tuple[QIcon, QSize]:
-    """Attached gear, kept sharp and scaled to fit the 36×32 header button."""
-    source = QPixmap(str(_SETTINGS_ICON_PATH))
-    limit = QSize(max(1, _HEADER_BUTTON.width() - 4), max(1, _HEADER_BUTTON.height() - 4))
-    screen = QApplication.primaryScreen() if QApplication.instance() else None
-    ratio = float(screen.devicePixelRatio()) if screen is not None and screen.devicePixelRatio() else 1.0
-    scaled = source.scaled(
-        QSize(max(1, round(limit.width() * ratio)), max(1, round(limit.height() * ratio))),
-        Qt.AspectRatioMode.KeepAspectRatio,
-        Qt.TransformationMode.SmoothTransformation,
-    )
-    scaled.setDevicePixelRatio(ratio)
-    logical = QSize(max(1, round(scaled.width() / ratio)), max(1, round(scaled.height() / ratio)))
-    return QIcon(scaled), logical
+def _paint_gear(painter: QPainter, size: float) -> None:
+    """White outline cog: eight teeth, a circular ring, and a round hole."""
+    teeth = 8
+    tip = size * 0.40
+    root = size * 0.28
+    hole = size * 0.11
+    pitch = (2 * math.pi) / teeth
+    tip_width = pitch * 0.34
+    root_width = pitch * 0.62
+    path = QPainterPath()
+
+    def point(radius: float, angle: float) -> QPointF:
+        return QPointF(math.cos(angle) * radius, math.sin(angle) * radius)
+
+    start = -math.pi / 2
+    path.moveTo(point(root, start - root_width / 2))
+    for index in range(teeth):
+        mid = start + index * pitch
+        path.lineTo(point(tip, mid - tip_width / 2))
+        path.lineTo(point(tip, mid + tip_width / 2))
+        path.lineTo(point(root, mid + root_width / 2))
+        path.lineTo(point(root, mid + pitch - root_width / 2))
+    path.closeSubpath()
+    painter.save()
+    painter.translate(size / 2, size / 2)
+    painter.drawPath(path)
+    painter.drawEllipse(QPointF(0, 0), hole, hole)
+    painter.restore()
 
 
 def maximize_geometry(available: QRect) -> QRect:
@@ -2399,13 +2424,8 @@ class MainWindow(QMainWindow):
     def _set_chrome_icon(self, button: QPushButton, kind: str) -> None:
         button.setText("")
         button.setToolTip("")
-        if kind == "settings":
-            icon, size = _settings_icon()
-            button.setIcon(icon)
-            button.setIconSize(size)
-        else:
-            button.setIcon(_chrome_icon(kind))
-            button.setIconSize(QSize(_ICON_PX, _ICON_PX))
+        button.setIcon(_chrome_icon(kind))
+        button.setIconSize(QSize(_ICON_PX, _ICON_PX))
         button.setProperty("chromeGlyph", kind)
 
     def _chrome_button(self, object_name: str, kind: str) -> QPushButton:
