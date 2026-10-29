@@ -10,7 +10,19 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QPoint,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QThread,
+    Signal,
+)
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication,
@@ -89,6 +101,7 @@ PROFILE_DIR = Path(".preply-profile")
 
 _HEADER_BUTTON = QSize(36, 32)
 _CORNER_RADIUS = 12.0
+MOTION_MS = 200
 
 
 def _gear_icon(color: str = "#ffffff", size: int = 15) -> QIcon:
@@ -114,6 +127,18 @@ def _gear_icon(color: str = "#ffffff", size: int = 15) -> QIcon:
         painter.rotate(45)
     painter.end()
     return QIcon(pixmap)
+
+
+def shrink_geometry(rect: QRect) -> QRect:
+    """A smaller rect toward the bottom of ``rect``, used to start or end a minimize."""
+    width = max(48, rect.width() // 3)
+    height = max(32, rect.height() // 3)
+    return QRect(rect.center().x() - width // 2, rect.bottom() - height, width, height)
+
+
+def maximize_geometry(available: QRect) -> QRect:
+    """The screen area maximize should fill, leaving the taskbar visible."""
+    return QRect(available)
 
 
 def _rounded_mask(rect, radius: float = _CORNER_RADIUS) -> QRegion:
@@ -1144,6 +1169,120 @@ class SavePanel(QWidget):
         self._write_copy(destination)
 
 
+class WindowMotion:
+    """Animates minimize, restore, and maximize. Close stays immediate."""
+
+    def __init__(self, window: QMainWindow) -> None:
+        self._window = window
+        self._normal: QRect | None = None
+        self._animation: QPropertyAnimation | None = None
+        self._dragging = False
+        self.mode: str | None = None
+
+    def note_drag(self, active: bool) -> None:
+        self._dragging = active
+        if active:
+            self.stop()
+
+    def stop(self) -> None:
+        self.mode = None
+        animation = self._animation
+        self._animation = None
+        if animation is not None:
+            animation.blockSignals(True)
+            animation.stop()
+            animation.deleteLater()
+
+    def remember_normal(self) -> None:
+        window = self._window
+        if window.isMaximized() or window.isMinimized() or self.mode is not None:
+            return
+        self._normal = QRect(window.geometry())
+
+    def normal_rect(self) -> QRect:
+        if self._normal is not None and self._normal.isValid():
+            return QRect(self._normal)
+        return QRect(self._window.geometry())
+
+    def _capture_if_idle(self) -> None:
+        if self.mode is None and not self._window.isMaximized() and not self._window.isMinimized():
+            self._normal = QRect(self._window.geometry())
+
+    def minimize(self) -> None:
+        if self._dragging:
+            self._capture_if_idle()
+            self._window.showMinimized()
+            return
+        self._capture_if_idle()
+        self.stop()
+        start = QRect(self._window.geometry())
+        self.mode = "minimize"
+        self._animate(start, shrink_geometry(start), self._after_minimize)
+
+    def _after_minimize(self) -> None:
+        if self.mode != "minimize":
+            return
+        self.mode = None
+        self._animation = None
+        self._window.showMinimized()
+
+    def restore_minimized(self) -> None:
+        self.stop()
+        target = self.normal_rect()
+        self._window.showNormal()
+        start = shrink_geometry(target)
+        self._window.setGeometry(start)
+        self._window._apply_corner_mask()
+        self.mode = "restore-min"
+        self._animate(start, target, self._after_geometry)
+
+    def maximize(self) -> None:
+        if self._dragging:
+            self._capture_if_idle()
+            self._window.showMaximized()
+            self._window._apply_corner_mask()
+            return
+        self._capture_if_idle()
+        self.stop()
+        screen = self._window.screen()
+        available = screen.availableGeometry() if screen is not None else QRect(self._window.geometry())
+        self.mode = "maximize"
+        self._animate(QRect(self._window.geometry()), maximize_geometry(available), self._after_maximize)
+
+    def _after_maximize(self) -> None:
+        if self.mode != "maximize":
+            return
+        self.mode = None
+        self._animation = None
+        self._window.showMaximized()
+        self._window._apply_corner_mask()
+
+    def restore_maximized(self) -> None:
+        self.stop()
+        target = self.normal_rect()
+        current = QRect(self._window.geometry())
+        self._window.showNormal()
+        self._window.setGeometry(current)
+        self._window._apply_corner_mask()
+        self.mode = "restore-max"
+        self._animate(current, target, self._after_geometry)
+
+    def _after_geometry(self) -> None:
+        self.mode = None
+        self._animation = None
+        self._window._apply_corner_mask()
+
+    def _animate(self, start: QRect, end: QRect, on_done) -> None:
+        animation = QPropertyAnimation(self._window, b"geometry", self._window)
+        animation.setDuration(MOTION_MS)
+        animation.setStartValue(start)
+        animation.setEndValue(end)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.finished.connect(on_done)
+        self._animation = animation
+        animation.start()
+
+
 class _TitleBar(QWidget):
     """Empty header area that drags a frameless window. Buttons handle their own clicks."""
 
@@ -1155,6 +1294,7 @@ class _TitleBar(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and not self._window.isMaximized():
+            self._window._motion.note_drag(True)
             self._offset = event.globalPosition().toPoint() - self._window.frameGeometry().topLeft()
         else:
             self._offset = None
@@ -1166,6 +1306,7 @@ class _TitleBar(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._window._motion.note_drag(False)
         self._offset = None
         super().mouseReleaseEvent(event)
 
@@ -1206,6 +1347,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(14)
 
+        self._motion = WindowMotion(self)
         self.title_bar = _TitleBar(self)
         header = QHBoxLayout(self.title_bar)
         header.setContentsMargins(0, 0, 0, 0)
@@ -1226,7 +1368,7 @@ class MainWindow(QMainWindow):
         self.minimize_button = self._chrome_button("windowButton", "–")
         self.maximize_button = self._chrome_button("windowButton", "□")
         self.close_button = self._chrome_button("closeButton", "✕")
-        self.minimize_button.clicked.connect(self.showMinimized)
+        self.minimize_button.clicked.connect(self._motion.minimize)
         self.maximize_button.clicked.connect(self._toggle_maximized)
         self.close_button.clicked.connect(self.close)
         header.addWidget(self.heading, 1)
@@ -1695,11 +1837,14 @@ class MainWindow(QMainWindow):
         return button
 
     def _toggle_maximized(self) -> None:
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            self.showMaximized()
-        self._sync_maximize_button()
+        mode = self._motion.mode
+        if self.isMinimized() or mode == "minimize":
+            self._motion.restore_minimized()
+            return
+        if self.isMaximized() or mode == "maximize":
+            self._motion.restore_maximized()
+            return
+        self._motion.maximize()
 
     def _sync_maximize_button(self) -> None:
         if self.isMaximized():
@@ -1730,6 +1875,7 @@ class MainWindow(QMainWindow):
             self._apply_corner_mask()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._motion.stop()
         self._discard_temp()
         self.worker.request_stop()
         self.worker.wait(30000)

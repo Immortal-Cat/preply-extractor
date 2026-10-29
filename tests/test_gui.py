@@ -1844,6 +1844,37 @@ class ChromeProfileTests(unittest.TestCase):
         self.assertNotIn("User Data", str(seen["dir"]))
 
 
+class WindowMotionTests(unittest.TestCase):
+    def test_saved_normal_rect_and_maximize_target(self) -> None:
+        from PySide6.QtCore import QRect
+
+        from preply_extractor.gui import MOTION_MS, maximize_geometry, shrink_geometry
+
+        self.assertGreaterEqual(MOTION_MS, 180)
+        self.assertLessEqual(MOTION_MS, 220)
+        normal = QRect(80, 60, 920, 700)
+        small = shrink_geometry(normal)
+        self.assertLess(small.width(), normal.width())
+        self.assertLess(small.height(), normal.height())
+        self.assertGreaterEqual(small.bottom(), normal.center().y())
+        screen = QRect(0, 0, 1920, 1040)
+        self.assertEqual(maximize_geometry(screen), screen)
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None):
+                window = MainWindow(settings_file=path)
+                window.show()
+                try:
+                    window.setGeometry(normal)
+                    window._motion.remember_normal()
+                    self.assertEqual(window._motion.normal_rect(), normal)
+                    self.assertIsNone(window._motion.mode)
+                finally:
+                    window.close()
+
+
 class ComponentRowTests(unittest.TestCase):
     def test_each_component_can_show_pending_ok_and_failed(self) -> None:
         from preply_extractor.gui import DependencyPanel
@@ -1931,11 +1962,17 @@ class FramelessWindowTests(unittest.TestCase):
                     self.assertEqual(window.pos().x(), 120)
                     self.assertEqual(window.pos().y(), 75)
 
+                    from PySide6.QtTest import QTest
+
+                    from preply_extractor.gui import MOTION_MS
+
                     window.maximize_button.click()
+                    QTest.qWait(MOTION_MS + 80)
                     self.assertTrue(window.isMaximized())
                     self.assertEqual(window.maximize_button.toolTip(), "")
                     self.assertEqual(window.maximize_button.text(), "❐")
                     window.maximize_button.click()
+                    QTest.qWait(MOTION_MS + 80)
                     self.assertFalse(window.isMaximized())
                     self.assertEqual(window.maximize_button.text(), "□")
                     self.assertFalse(window.mask().isEmpty())
