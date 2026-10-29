@@ -1878,6 +1878,40 @@ class WindowMotionTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_minimize_keeps_the_normal_restore_rect(self) -> None:
+        from PySide6.QtCore import QRect
+        from PySide6.QtTest import QTest
+
+        from preply_extractor.gui import MOTION_MS
+
+        normal = QRect(80, 60, 920, 700)
+        dock = QRect(1200, 980, 44, 40)
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None):
+                window = MainWindow(settings_file=path)
+                window.show()
+                try:
+                    window.setGeometry(normal)
+                    window._motion.remember_normal()
+                    window._motion._dock_rect = lambda: QRect(dock)
+                    window.minimize_button.click()
+                    self.assertEqual(window.geometry(), normal)
+                    self.assertNotEqual(window.geometry(), dock)
+                    QTest.qWait(MOTION_MS + 120)
+                    self.assertEqual(window._motion.normal_rect(), normal)
+                    self.assertNotEqual(window._motion.normal_rect(), dock)
+                    self.assertNotEqual(window.geometry(), dock)
+                    self.assertEqual(window.geometry().size(), normal.size())
+                    window._motion.restore_from_shell()
+                    self.assertFalse(window.isMinimized())
+                    self.assertEqual(window.geometry(), normal)
+                    self.assertEqual(window.windowOpacity(), 1.0)
+                    self.assertIsNone(window._motion._snapshot)
+                finally:
+                    window.close()
+
 
 class ComponentRowTests(unittest.TestCase):
     def test_each_component_can_show_pending_ok_and_failed(self) -> None:

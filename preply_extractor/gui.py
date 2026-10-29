@@ -27,7 +27,7 @@ from PySide6.QtCore import (
     QThread,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap, QWindowStateChangeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -209,6 +209,24 @@ class _AppBarData(ctypes.Structure):
         ("rc", _WinRect),
         ("lParam", wintypes.LPARAM),
     ]
+
+
+class _WinMsg(ctypes.Structure):
+    """Win32 MSG. wParam is aligned so SC_RESTORE can be read from a nativeEvent."""
+
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_size_t),
+        ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint),
+        ("pt_x", ctypes.c_long),
+        ("pt_y", ctypes.c_long),
+    ]
+
+
+_WM_SYSCOMMAND = 0x0112
+_SC_RESTORE = 0xF120
 
 
 class _Guid(ctypes.Structure):
@@ -1555,6 +1573,7 @@ class WindowMotion:
         self._animation: QParallelAnimationGroup | None = None
         self._snapshot: _MotionSnapshot | None = None
         self._dragging = False
+        self._shell_restore = False
         self.mode: str | None = None
 
     def note_drag(self, active: bool) -> None:
@@ -1600,50 +1619,59 @@ class WindowMotion:
         return QRect(available.center().x() - 24, available.bottom() - 40, 48, 40)
 
     def minimize(self) -> None:
+        """Fly a snapshot to the taskbar button. The live window stays at its normal rect.
+
+        The frame cannot shrink to the icon (its minimum size is larger than a taskbar
+        button), and Windows restores whatever geometry was current at showMinimized().
+        """
         if self._dragging:
             self._capture_if_idle()
+            self._place_normal()
             self._window.showMinimized()
             return
         self._capture_if_idle()
         self.stop()
         start = QRect(self._window.geometry())
+        self._show_snapshot(start)
+        self._window.setWindowOpacity(0.0)
+        self._place_normal()
         self.mode = "minimize"
-        self._window.setWindowOpacity(1.0)
-        self._animate(self._window, start, self._dock_rect(), self._after_minimize, opacity_end=0.35)
+        self._animate(self._snapshot, start, self._dock_rect(), self._after_minimize, opacity_end=0.0)
+
+    def _place_normal(self) -> None:
+        self._window.setGeometry(self.normal_rect())
 
     def _after_minimize(self) -> None:
         if self.mode != "minimize":
             return
         self.mode = None
         self._animation = None
+        self._place_normal()
+        self._drop_snapshot()
         self._window.showMinimized()
         self._window.setWindowOpacity(1.0)
 
     def restore_minimized(self) -> None:
-        was_minimizing = self.mode == "minimize"
-        self.stop()
-        if was_minimizing and not self._window.isMinimized():
-            self._window.setGeometry(self.normal_rect())
-            self._window.setWindowOpacity(1.0)
-            self._window._sync_corners()
-            return
-        target = self.normal_rect()
-        origin = self._dock_rect()
-        self._window.setWindowOpacity(0.0)
-        self._window.showNormal()
-        self._window.setGeometry(origin)
-        self._window._sync_corners()
-        self._window.setWindowOpacity(0.15)
-        self.mode = "restore-min"
-        self._animate(self._window, origin, target, self._after_restore_min, opacity_end=1.0)
+        self.restore_from_shell()
 
-    def _after_restore_min(self) -> None:
-        if self.mode != "restore-min":
+    def restore_from_shell(self) -> None:
+        """Taskbar click: previous size and position, full opacity, no dock rect, no snapshot."""
+        if self._shell_restore:
             return
-        self.mode = None
-        self._animation = None
-        self._window.setWindowOpacity(1.0)
-        self._window._sync_corners()
+        self._shell_restore = True
+        try:
+            self.stop()
+            rect = self.normal_rect()
+            window = self._window
+            window.setWindowOpacity(1.0)
+            if window.isMinimized() or window.isMaximized():
+                window.showNormal()
+            window.setGeometry(rect)
+            window._sync_corners()
+            window.raise_()
+            window.activateWindow()
+        finally:
+            self._shell_restore = False
 
     def maximize(self) -> None:
         if self._dragging:
@@ -2324,9 +2352,34 @@ class MainWindow(QMainWindow):
 
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
-        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "maximize_button"):
+        if event.type() != QEvent.Type.WindowStateChange:
+            return
+        if (
+            isinstance(event, QWindowStateChangeEvent)
+            and event.oldState() & Qt.WindowState.WindowMinimized
+            and not self.isMinimized()
+            and hasattr(self, "_motion")
+        ):
+            self._motion.restore_from_shell()
+        if hasattr(self, "maximize_button"):
             self._sync_maximize_button()
             self._sync_corners()
+
+    def nativeEvent(self, eventType, message):  # noqa: N802
+        """Frameless windows often swallow SC_RESTORE. Put the saved geometry back."""
+        if sys.platform == "win32":
+            try:
+                if bytes(eventType) == b"windows_generic_MSG":
+                    address = int(message)
+                    if address:
+                        msg = _WinMsg.from_address(address)
+                        command = int(msg.wParam) & 0xFFF0
+                        if msg.message == _WM_SYSCOMMAND and command == _SC_RESTORE and self.isMinimized():
+                            self._motion.restore_from_shell()
+                            return True, 0
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return super().nativeEvent(eventType, message)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._motion.stop()
