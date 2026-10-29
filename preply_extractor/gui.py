@@ -10,8 +10,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -85,6 +85,7 @@ PROFILE_DIR = Path(".preply-profile")
 
 
 _HEADER_BUTTON = QSize(36, 32)
+_CORNER_RADIUS = 12.0
 
 
 def _gear_icon(color: str = "#ffffff", size: int = 15) -> QIcon:
@@ -110,6 +111,13 @@ def _gear_icon(color: str = "#ffffff", size: int = 15) -> QIcon:
         painter.rotate(45)
     painter.end()
     return QIcon(pixmap)
+
+
+def _rounded_mask(rect, radius: float = _CORNER_RADIUS) -> QRegion:
+    """Pixel mask for a frameless window. Maximized windows do not use it."""
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(rect), radius, radius)
+    return QRegion(path.toFillPolygon().toPolygon())
 
 
 def program_profile_directory() -> Path:
@@ -1617,10 +1625,26 @@ class MainWindow(QMainWindow):
             self.maximize_button.setText("□")
         self.maximize_button.setToolTip("")
 
+    def _apply_corner_mask(self) -> None:
+        """Round the frame while windowed. A maximized window stays square."""
+        if self.isMaximized() or self.isFullScreen() or self.width() < 1 or self.height() < 1:
+            self.clearMask()
+            return
+        self.setMask(_rounded_mask(self.rect(), _CORNER_RADIUS))
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._apply_corner_mask()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_corner_mask()
+
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "maximize_button"):
             self._sync_maximize_button()
+            self._apply_corner_mask()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._discard_temp()

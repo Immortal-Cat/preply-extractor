@@ -1902,6 +1902,15 @@ class FramelessWindowTests(unittest.TestCase):
                     window.maximize_button.click()
                     self.assertFalse(window.isMaximized())
                     self.assertEqual(window.maximize_button.text(), "□")
+                    self.assertFalse(window.mask().isEmpty())
+                    self.assertFalse(window.mask().contains(window.rect().topLeft()))
+                    self.assertTrue(window.mask().contains(window.rect().center()))
+
+                    window.showMaximized()
+                    self.assertTrue(window.mask().isEmpty())
+                    window.showNormal()
+                    self.assertFalse(window.mask().isEmpty())
+                    self.assertFalse(window.mask().contains(window.rect().topLeft()))
 
                     closed: list[object] = []
 
