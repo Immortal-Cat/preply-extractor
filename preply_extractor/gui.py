@@ -53,9 +53,12 @@ from preply_extractor.gui_logic import (
     DEPENDENCY_ORDER,
     BrowserInstallError,
     _install_failure_detail,
+    chromium_executable_exists,
     dependencies_ready,
     inspect_dependencies,
     install_missing_dependencies,
+    module_importable,
+    playwright_importable,
     join_deck_path,
     language_label,
     language_plan,
@@ -162,6 +165,7 @@ class ExportWorker(QThread):
     profile_ready = Signal(object)
     connect_failed = Signal(str)
     dependencies_checked = Signal(object)
+    dependency_item = Signal(str, bool)
     dependency_failed = Signal(str)
     build_progress = Signal(int, int, str)
     build_ready = Signal(str, object)
@@ -288,11 +292,33 @@ class ExportWorker(QThread):
         except Exception:
             self.connect_failed.emit(str(exc).strip() or "error")
 
+    def _publish_dependencies(self) -> dict[str, bool]:
+        """Check one component at a time so each row can leave the spinner."""
+        report: dict[str, bool] = {}
+        playwright_ok = False
+        for key in DEPENDENCY_ORDER:
+            if self._stop:
+                break
+            if key == "pyside6":
+                ok = module_importable("PySide6")
+            elif key == "requests":
+                ok = module_importable("requests")
+            elif key == "playwright":
+                ok = playwright_importable()
+                playwright_ok = ok
+            elif key == "chromium":
+                ok = chromium_executable_exists() if playwright_ok else False
+            else:
+                ok = False
+            report[key] = ok
+            self.dependency_item.emit(key, ok)
+        return report
+
     def _check_dependencies(self) -> None:
         if self._stop:
             return
         self._emit_status("checking", ("key", "checking_components", {}))
-        report = inspect_dependencies()
+        report = self._publish_dependencies()
         if self._stop:
             return
         self.dependencies_checked.emit(report)
@@ -327,14 +353,14 @@ class ExportWorker(QThread):
         except Exception as exc:
             if not self._stop:
                 try:
-                    self.dependencies_checked.emit(inspect_dependencies())
+                    self.dependencies_checked.emit(self._publish_dependencies())
                 except Exception:
                     pass
                 self._report_dependency_error(exc)
             return
         if self._stop:
             return
-        fresh = inspect_dependencies()
+        fresh = self._publish_dependencies()
         self.dependencies_checked.emit(fresh)
         if not dependencies_ready(fresh):
             self._emit_dependency_failure(("key", "deps_still_missing", {}))
@@ -490,6 +516,52 @@ class ExportWorker(QThread):
             self._emit_failure(self.connect_failed, self._connect_failed_queue, ("key", "login_window_closed", {}))
 
 
+class _ComponentRow(QWidget):
+    """One dependency line: name plus a spinner, a checkmark, or an X."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__()
+        self.key = key
+        self._state = "pending"
+        self.name = QLabel(tr(f"component_{key}"))
+        self.mark = QLabel("")
+        self.mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mark.setFixedWidth(22)
+        self.spinner = QProgressBar()
+        self.spinner.setRange(0, 0)
+        self.spinner.setTextVisible(False)
+        self.spinner.setFixedSize(18, 18)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.name, 1)
+        layout.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.mark, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.set_state("pending")
+
+    def set_state(self, state: str) -> None:
+        self._state = state
+        if state == "ok":
+            self.spinner.hide()
+            self.mark.setText("✓")
+            self.mark.setStyleSheet("color: #2dd4bf; font-size: 16px; background: transparent;")
+            self.mark.show()
+            return
+        if state == "failed":
+            self.spinner.hide()
+            self.mark.setText("✕")
+            self.mark.setStyleSheet("color: #fb7185; font-size: 16px; background: transparent;")
+            self.mark.show()
+            return
+        self._state = "pending"
+        self.mark.hide()
+        self.mark.setText("")
+        self.spinner.show()
+
+    def retranslate(self) -> None:
+        self.name.setText(tr(f"component_{self.key}"))
+
+
 class DependencyPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -500,31 +572,34 @@ class DependencyPanel(QWidget):
         self.title.setObjectName("title")
         self.hint = QLabel(tr("deps_hint"))
         self.hint.setWordWrap(True)
-        self.lines = QLabel("")
-        self.lines.setObjectName("detail")
-        self.lines.setWordWrap(True)
-        self.lines.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.rows = {key: _ComponentRow(key) for key in DEPENDENCY_ORDER}
         self.install_button = QPushButton(tr("install_components"))
         self.install_button.setObjectName("primary")
         self.install_button.setEnabled(False)
         self.install_button.hide()
         self._repair = False
-        row = QHBoxLayout()
-        row.addWidget(self.install_button)
-        row.addStretch(1)
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.install_button)
+        button_row.addStretch(1)
         layout.addWidget(self.title)
         layout.addWidget(self.hint)
-        layout.addWidget(self.lines)
-        layout.addLayout(row)
+        for key in DEPENDENCY_ORDER:
+            layout.addWidget(self.rows[key])
+        layout.addLayout(button_row)
         layout.addStretch(1)
 
+    def begin_checks(self) -> None:
+        for row in self.rows.values():
+            row.set_state("pending")
+
+    def set_result(self, key: str, ok: bool) -> None:
+        row = self.rows.get(key)
+        if row is not None:
+            row.set_state("ok" if ok else "failed")
+
     def show_report(self, report: dict[str, bool], *, repair: bool) -> None:
-        rows = []
         for key in DEPENDENCY_ORDER:
-            name = tr(f"component_{key}")
-            state_key = "component_ok" if report.get(key) else "component_missing"
-            rows.append(tr(state_key, name=name))
-        self.lines.setText("\n".join(rows))
+            self.set_result(key, bool(report.get(key)))
         ready = dependencies_ready(report)
         self._repair = repair and not ready
         self.install_button.setVisible(not ready)
@@ -534,6 +609,8 @@ class DependencyPanel(QWidget):
     def retranslate(self) -> None:
         self.title.setText(tr("deps_title"))
         self.hint.setText(tr("deps_hint"))
+        for row in self.rows.values():
+            row.retranslate()
         self.install_button.setText(tr("repair_components" if self._repair else "install_components"))
 
 
@@ -1216,6 +1293,7 @@ class MainWindow(QMainWindow):
         self.worker.connect_failed.connect(self._on_connect_failed)
         self.worker.login_window_opened.connect(self._on_login_window_opened)
         self.worker.dependencies_checked.connect(self._on_dependencies)
+        self.worker.dependency_item.connect(self._on_dependency_item)
         self.worker.dependency_failed.connect(self._on_dependency_failed)
         self.worker.build_progress.connect(self._on_build_progress)
         self.worker.build_ready.connect(self._on_build_ready)
@@ -1302,6 +1380,7 @@ class MainWindow(QMainWindow):
 
     def _install_missing(self) -> None:
         self._install_attempted = True
+        self.deps_panel.begin_checks()
         self.deps_panel.install_button.setEnabled(False)
         try:
             self._show_step(_STEP_DEPS)
@@ -1344,6 +1423,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.login_panel.continue_button.setEnabled(True)
             self._apply_phrase("failed", phrase_for_exception(exc))
+
+    def _on_dependency_item(self, key: str, ok: bool) -> None:
+        self.deps_panel.set_result(key, bool(ok))
 
     def _on_dependencies(self, report: object) -> None:
         items = dict(report) if isinstance(report, dict) else {}
@@ -1521,6 +1603,7 @@ class MainWindow(QMainWindow):
         self.login_panel.continue_button.hide()
         self._install_attempted = False
         self._show_step(_STEP_DEPS)
+        self.deps_panel.begin_checks()
         self._apply_phrase("checking", ("key", "checking_components", {}))
         self._ensure_worker()
         self.worker.release_session()

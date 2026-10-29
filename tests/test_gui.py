@@ -822,8 +822,12 @@ class StartupFlowTests(unittest.TestCase):
                     self.assertEqual(window.stack.currentIndex(), _STEP_DEPS)
                     self.assertTrue(window.deps_panel.install_button.isEnabled())
                     self.assertEqual(window.deps_panel.install_button.text(), "Установить")
-                    self.assertIn("Playwright: не установлено", window.deps_panel.lines.text())
-                    self.assertIn("Chromium: не установлено", window.deps_panel.lines.text())
+                    self.assertEqual(window.deps_panel.rows["playwright"].name.text(), "Playwright")
+                    self.assertEqual(window.deps_panel.rows["playwright"]._state, "failed")
+                    self.assertEqual(window.deps_panel.rows["playwright"].mark.text(), "✕")
+                    self.assertEqual(window.deps_panel.rows["chromium"]._state, "failed")
+                    self.assertEqual(window.deps_panel.rows["pyside6"]._state, "ok")
+                    self.assertEqual(window.deps_panel.rows["pyside6"].mark.text(), "✓")
                     launched.assert_not_called()
                     window.worker._commands.get_nowait()
                     window.deps_panel.install_button.click()
@@ -1838,6 +1842,38 @@ class ChromeProfileTests(unittest.TestCase):
         self.assertEqual(seen["channel"], "chrome")
         self.assertTrue(str(seen["dir"]).endswith(".preply-profile"))
         self.assertNotIn("User Data", str(seen["dir"]))
+
+
+class ComponentRowTests(unittest.TestCase):
+    def test_each_component_can_show_pending_ok_and_failed(self) -> None:
+        from preply_extractor.gui import DependencyPanel
+        from preply_extractor.gui_logic import DEPENDENCY_ORDER
+
+        _app()
+        panel = DependencyPanel()
+        try:
+            self.assertEqual(tuple(panel.rows), DEPENDENCY_ORDER)
+            for key in DEPENDENCY_ORDER:
+                row = panel.rows[key]
+                self.assertEqual(row._state, "pending")
+                self.assertFalse(row.spinner.isHidden())
+                self.assertTrue(row.mark.isHidden())
+            panel.show_report(
+                {"pyside6": True, "requests": True, "playwright": False, "chromium": False},
+                repair=False,
+            )
+            self.assertEqual(panel.rows["requests"]._state, "ok")
+            self.assertEqual(panel.rows["requests"].mark.text(), "✓")
+            self.assertTrue(panel.rows["requests"].spinner.isHidden())
+            self.assertEqual(panel.rows["chromium"]._state, "failed")
+            self.assertEqual(panel.rows["chromium"].mark.text(), "✕")
+            self.assertFalse(panel.install_button.isHidden())
+            panel.begin_checks()
+            for key in DEPENDENCY_ORDER:
+                self.assertEqual(panel.rows[key]._state, "pending")
+                self.assertFalse(panel.rows[key].spinner.isHidden())
+        finally:
+            panel.close()
 
 
 class FramelessWindowTests(unittest.TestCase):
