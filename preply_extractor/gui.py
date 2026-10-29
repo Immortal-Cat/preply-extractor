@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from ctypes import wintypes
 from pathlib import Path
@@ -162,6 +164,22 @@ def maximize_geometry(available: QRect) -> QRect:
     return QRect(available)
 
 
+def logical_taskbar_rect(rect: QRect | None, pixel_ratio: float, screen: QRect | None) -> QRect | None:
+    """UIA returns physical pixels once Qt marks the process DPI-aware."""
+    if rect is None or rect.width() <= 0 or rect.height() <= 0:
+        return None
+    if pixel_ratio <= 1.01 or screen is None or not screen.isValid():
+        return QRect(rect)
+    if screen.contains(rect.center()):
+        return QRect(rect)
+    return QRect(
+        round(rect.x() / pixel_ratio),
+        round(rect.y() / pixel_ratio),
+        max(1, round(rect.width() / pixel_ratio)),
+        max(1, round(rect.height() / pixel_ratio)),
+    )
+
+
 def taskbar_target_rect(button: QRect | None, taskbar: QRect | None) -> QRect:
     """Prefer the taskbar button. Otherwise a small rect at the center of the bar."""
     if button is not None and button.width() > 0 and button.height() > 0:
@@ -227,6 +245,22 @@ class _WinMsg(ctypes.Structure):
 
 _WM_SYSCOMMAND = 0x0112
 _SC_RESTORE = 0xF120
+_SC_MINIMIZE = 0xF020
+_APP_USER_MODEL_ID = "ImmortalCat.PreplyExtractor"
+_log = logging.getLogger(__name__)
+
+
+def _set_app_user_model_id() -> None:
+    """Give this process its own taskbar button, separate from python.exe."""
+    if sys.platform != "win32":
+        return
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
+        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+        shell32.SetCurrentProcessExplicitAppUserModelID(_APP_USER_MODEL_ID)
+    except Exception:
+        return
 
 
 class _Guid(ctypes.Structure):
@@ -483,17 +517,42 @@ def _uia_native_hwnd(element) -> int:
     return int(handle.value)
 
 
+def _uia_property_string(element, prop_id: int) -> str:
+    value = _Variant()
+    result = _com_call(
+        element,
+        10,
+        ctypes.c_long,
+        [ctypes.c_int, ctypes.POINTER(_Variant)],
+        prop_id,
+        ctypes.byref(value),
+    )
+    try:
+        if result != 0 or value.vt != 8 or not value.bstrVal:
+            return ""
+        return ctypes.wstring_at(value.bstrVal)
+    finally:
+        _clear_variant(value)
+
+
 def _uia_matching_buttons(buttons: list, hwnd: int, title: str) -> list[tuple[int, QRect]]:
     matches: list[tuple[int, QRect]] = []
+    app_id = _APP_USER_MODEL_ID.casefold()
     try:
         for item in buttons:
             name = _uia_text(item, 23)
+            automation_id = _uia_property_string(item, 30011)
             native = _uia_native_hwnd(item)
             bounds = _uia_bounds(item)
-            if bounds.width() <= 0 or bounds.height() <= 0 or bounds.height() > 120:
+            if bounds.width() <= 0 or bounds.height() <= 0 or bounds.height() > 240:
                 continue
-            if (hwnd and native == hwnd) or _taskbar_name_matches(name, title):
-                matches.append((_taskbar_name_rank(name), bounds))
+            by_handle = bool(hwnd and native and int(native) == int(hwnd))
+            by_title = _taskbar_name_matches(name, title)
+            by_app = app_id in automation_id.casefold()
+            if not (by_handle or by_title or by_app):
+                continue
+            rank = 0 if by_handle else _taskbar_name_rank(name) if by_title else 3
+            matches.append((rank, bounds))
     finally:
         for item in buttons:
             _com_release(item)
@@ -1522,7 +1581,7 @@ class SavePanel(QWidget):
 
 
 class _MotionSnapshot(QWidget):
-    """A still picture of the window, so maximize does not reflow the live layout."""
+    """One opaque picture of the window. A translucent layered window flickers when resized."""
 
     def __init__(self, pixmap: QPixmap) -> None:
         flags = (
@@ -1532,13 +1591,14 @@ class _MotionSnapshot(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         super().__init__(None, flags)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._pixmap = pixmap
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QColor(THEMES[DEFAULT_THEME].background))
         painter.drawPixmap(self.rect(), self._pixmap)
 
 
@@ -1574,6 +1634,7 @@ class WindowMotion:
         self._snapshot: _MotionSnapshot | None = None
         self._dragging = False
         self._shell_restore = False
+        self._concealed = False
         self.mode: str | None = None
 
     def note_drag(self, active: bool) -> None:
@@ -1581,8 +1642,11 @@ class WindowMotion:
         if active:
             self.stop()
 
-    def stop(self) -> None:
+    def stop(self, reveal: str = "auto") -> None:
+        concealed = self._concealed
+        mode = self.mode
         self.mode = None
+        self._concealed = False
         animation = self._animation
         self._animation = None
         if animation is not None:
@@ -1590,8 +1654,14 @@ class WindowMotion:
             animation.stop()
             animation.deleteLater()
         self._drop_snapshot()
-        if self._window.windowOpacity() != 1.0:
-            self._window.setWindowOpacity(1.0)
+        self._window.setWindowOpacity(1.0)
+        if not concealed or reveal == "none":
+            return
+        if reveal == "minimize" or (reveal == "auto" and mode == "minimize"):
+            self._place_normal()
+            self._window.showMinimized()
+            return
+        self._reveal_normal()
 
     def remember_normal(self) -> None:
         window = self._window
@@ -1609,9 +1679,20 @@ class WindowMotion:
             self._normal = QRect(self._window.geometry())
 
     def _dock_rect(self) -> QRect:
-        button = find_taskbar_button_rect(int(self._window.winId()), self._window.windowTitle())
         screen = self._window.screen()
         ratio = float(screen.devicePixelRatio()) if screen is not None and screen.devicePixelRatio() else 1.0
+        screen_rect = screen.geometry() if screen is not None else None
+        button = logical_taskbar_rect(
+            find_taskbar_button_rect(int(self._window.winId()), self._window.windowTitle()),
+            ratio,
+            screen_rect,
+        )
+        found = button is not None
+        _log.info(
+            "taskbar button found=%s rect=%s",
+            found,
+            None if button is None else (button.x(), button.y(), button.width(), button.height()),
+        )
         target = taskbar_target_rect(button, taskbar_bar_rect(ratio))
         if target.width() > 0 and target.height() > 0:
             return target
@@ -1619,37 +1700,56 @@ class WindowMotion:
         return QRect(available.center().x() - 24, available.bottom() - 40, 48, 40)
 
     def minimize(self) -> None:
-        """Fly a snapshot to the taskbar button. The live window stays at its normal rect.
+        """Fly one snapshot to the taskbar button. The live window is hidden for the whole flight.
 
-        The frame cannot shrink to the icon (its minimum size is larger than a taskbar
-        button), and Windows restores whatever geometry was current at showMinimized().
+        It is shown again only at the end, already minimized, at the saved geometry.
         """
+        if self.mode == "minimize":
+            return
         if self._dragging:
             self._capture_if_idle()
             self._place_normal()
             self._window.showMinimized()
             return
         self._capture_if_idle()
-        self.stop()
+        self.stop(reveal="none")
+        if not self._window.isVisible():
+            self._reveal_normal()
         start = QRect(self._window.geometry())
         self._show_snapshot(start)
-        self._window.setWindowOpacity(0.0)
         self._place_normal()
+        self._conceal()
         self.mode = "minimize"
-        self._animate(self._snapshot, start, self._dock_rect(), self._after_minimize, opacity_end=0.0)
+        self._animate(self._snapshot, start, self._dock_rect(), self._after_minimize)
+
+    def _conceal(self) -> None:
+        self._concealed = True
+        self._window.hide()
 
     def _place_normal(self) -> None:
         self._window.setGeometry(self.normal_rect())
+
+    def _reveal_normal(self) -> None:
+        rect = self.normal_rect()
+        self._concealed = False
+        self._window.setWindowOpacity(1.0)
+        self._window.showNormal()
+        self._window.setGeometry(rect)
+        self._window._sync_corners()
+
+    def _reveal_minimized(self) -> None:
+        self._place_normal()
+        self._concealed = False
+        self._window.setWindowOpacity(1.0)
+        self._window.showMinimized()
 
     def _after_minimize(self) -> None:
         if self.mode != "minimize":
             return
         self.mode = None
         self._animation = None
-        self._place_normal()
+        self._reveal_minimized()
         self._drop_snapshot()
-        self._window.showMinimized()
-        self._window.setWindowOpacity(1.0)
 
     def restore_minimized(self) -> None:
         self.restore_from_shell()
@@ -1660,16 +1760,10 @@ class WindowMotion:
             return
         self._shell_restore = True
         try:
-            self.stop()
-            rect = self.normal_rect()
-            window = self._window
-            window.setWindowOpacity(1.0)
-            if window.isMinimized() or window.isMaximized():
-                window.showNormal()
-            window.setGeometry(rect)
-            window._sync_corners()
-            window.raise_()
-            window.activateWindow()
+            self.stop(reveal="none")
+            self._reveal_normal()
+            self._window.raise_()
+            self._window.activateWindow()
         finally:
             self._shell_restore = False
 
@@ -1680,12 +1774,14 @@ class WindowMotion:
             self._window._sync_corners()
             return
         self._capture_if_idle()
-        self.stop()
+        self.stop(reveal="none")
+        if not self._window.isVisible():
+            self._reveal_normal()
         screen = self._window.screen()
         available = screen.availableGeometry() if screen is not None else QRect(self._window.geometry())
         start = QRect(self._window.geometry())
         self._show_snapshot(start)
-        self._window.setWindowOpacity(0.0)
+        self._conceal()
         self.mode = "maximize"
         self._animate(self._snapshot, start, maximize_geometry(available), self._after_maximize)
 
@@ -1694,22 +1790,24 @@ class WindowMotion:
             return
         self.mode = None
         self._animation = None
-        self._window.showMaximized()
+        self._concealed = False
         self._window.setWindowOpacity(1.0)
+        self._window.showMaximized()
         self._window._sync_corners()
         self._drop_snapshot()
 
     def restore_maximized(self) -> None:
-        self.stop()
+        self.stop(reveal="none")
         if not self._window.isMaximized():
+            if not self._window.isVisible():
+                self._reveal_normal()
             self._window.setWindowOpacity(1.0)
             self._window._sync_corners()
             return
         target = self.normal_rect()
         start = QRect(self._window.geometry())
         self._show_snapshot(start)
-        self._window.setWindowOpacity(0.0)
-        self._window.showNormal()
+        self._conceal()
         self.mode = "restore-max"
         self._animate(self._snapshot, start, target, self._after_restore_max)
 
@@ -1718,9 +1816,7 @@ class WindowMotion:
             return
         self.mode = None
         self._animation = None
-        self._window.setGeometry(self.normal_rect())
-        self._window.setWindowOpacity(1.0)
-        self._window._sync_corners()
+        self._reveal_normal()
         self._drop_snapshot()
 
     def _show_snapshot(self, rect: QRect) -> None:
@@ -1795,7 +1891,9 @@ class _TitleBar(QWidget):
 
 class MainWindow(QMainWindow):
     def __init__(self, settings_file: Path | None = None) -> None:
+        _set_app_user_model_id()
         super().__init__()
+        self._restored_at = 0.0
         self._settings_path = settings_path() if settings_file is None else settings_file
         stored = load_settings(self._settings_path)
         set_language(stored.ui_language)
@@ -2365,17 +2463,35 @@ class MainWindow(QMainWindow):
             self._sync_maximize_button()
             self._sync_corners()
 
+    def _handle_shell_command(self, command: int) -> bool:
+        """Taskbar toggle. One click either minimizes or restores, never both."""
+        command &= 0xFFF0
+        if command == _SC_MINIMIZE:
+            if self.isMinimized() or self._motion.mode == "minimize":
+                return True
+            if time.monotonic() - self._restored_at < 0.15:
+                return True
+            self._motion.minimize()
+            return True
+        if command == _SC_RESTORE:
+            if self._motion.mode == "minimize":
+                return True
+            if self.isVisible() and not self.isMinimized() and not self._motion._concealed:
+                return True
+            self._restored_at = time.monotonic()
+            self._motion.restore_from_shell()
+            return True
+        return False
+
     def nativeEvent(self, eventType, message):  # noqa: N802
-        """Frameless windows often swallow SC_RESTORE. Put the saved geometry back."""
+        """Frameless windows ignore SC_MINIMIZE and SC_RESTORE from the taskbar."""
         if sys.platform == "win32":
             try:
                 if bytes(eventType) == b"windows_generic_MSG":
                     address = int(message)
                     if address:
                         msg = _WinMsg.from_address(address)
-                        command = int(msg.wParam) & 0xFFF0
-                        if msg.message == _WM_SYSCOMMAND and command == _SC_RESTORE and self.isMinimized():
-                            self._motion.restore_from_shell()
+                        if msg.message == _WM_SYSCOMMAND and self._handle_shell_command(int(msg.wParam)):
                             return True, 0
             except (TypeError, ValueError, OverflowError):
                 pass
@@ -2390,6 +2506,7 @@ class MainWindow(QMainWindow):
 
 
 def main(argv: list[str] | None = None) -> int:
+    _set_app_user_model_id()
     app = QApplication.instance() or QApplication(argv or sys.argv)
     app.setFont(QFont("Segoe UI", 11))
     apply_theme(app, DEFAULT_THEME)

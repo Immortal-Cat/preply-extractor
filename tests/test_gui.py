@@ -1912,6 +1912,50 @@ class WindowMotionTests(unittest.TestCase):
                 finally:
                     window.close()
 
+    def test_shell_commands_toggle_and_keep_the_saved_rect(self) -> None:
+        from PySide6.QtCore import QRect
+        from PySide6.QtTest import QTest
+
+        from preply_extractor.gui import MOTION_MS, _SC_MINIMIZE, _SC_RESTORE, logical_taskbar_rect
+
+        physical = QRect(1976, 1824, 88, 96)
+        screen = QRect(0, 0, 1536, 960)
+        self.assertEqual(logical_taskbar_rect(physical, 2.0, screen), QRect(988, 912, 44, 48))
+        self.assertEqual(logical_taskbar_rect(QRect(988, 912, 44, 48), 2.0, screen), QRect(988, 912, 44, 48))
+
+        normal = QRect(80, 60, 920, 700)
+        button = QRect(640, 900, 44, 48)
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            with patch.object(ExportWorker, "start", lambda *_args, **_kwargs: None):
+                window = MainWindow(settings_file=path)
+                window.show()
+                try:
+                    window.setGeometry(normal)
+                    window._motion.remember_normal()
+                    with patch("preply_extractor.gui.find_taskbar_button_rect", return_value=QRect(button)):
+                        self.assertEqual(window._motion._dock_rect(), button)
+                    window._motion._dock_rect = lambda: QRect(button)
+                    self.assertTrue(window._handle_shell_command(_SC_MINIMIZE))
+                    self.assertEqual(window._motion.mode, "minimize")
+                    self.assertEqual(window._motion.normal_rect(), normal)
+                    self.assertTrue(window._handle_shell_command(_SC_RESTORE))
+                    self.assertEqual(window._motion.mode, "minimize")
+                    QTest.qWait(MOTION_MS + 150)
+                    self.assertEqual(window._motion.normal_rect(), normal)
+                    self.assertNotEqual(window.geometry(), button)
+                    self.assertEqual(window.geometry().size(), normal.size())
+                    self.assertTrue(window._handle_shell_command(_SC_RESTORE))
+                    self.assertFalse(window.isMinimized())
+                    self.assertEqual(window.geometry(), normal)
+                    self.assertEqual(window.windowOpacity(), 1.0)
+                    self.assertTrue(window._handle_shell_command(_SC_MINIMIZE))
+                    self.assertFalse(window.isMinimized())
+                    self.assertEqual(window.geometry(), normal)
+                finally:
+                    window.close()
+
 
 class ComponentRowTests(unittest.TestCase):
     def test_each_component_can_show_pending_ok_and_failed(self) -> None:
