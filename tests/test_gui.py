@@ -1848,17 +1848,21 @@ class WindowMotionTests(unittest.TestCase):
     def test_saved_normal_rect_and_maximize_target(self) -> None:
         from PySide6.QtCore import QRect
 
-        from preply_extractor.gui import MOTION_MS, maximize_geometry, shrink_geometry
+        from preply_extractor.gui import MOTION_MS, maximize_geometry, taskbar_target_rect
 
         self.assertGreaterEqual(MOTION_MS, 180)
         self.assertLessEqual(MOTION_MS, 220)
-        normal = QRect(80, 60, 920, 700)
-        small = shrink_geometry(normal)
-        self.assertLess(small.width(), normal.width())
-        self.assertLess(small.height(), normal.height())
-        self.assertGreaterEqual(small.bottom(), normal.center().y())
+        button = QRect(988, 912, 44, 48)
+        bar = QRect(0, 912, 1536, 48)
+        self.assertEqual(taskbar_target_rect(button, bar), button)
+        fallback = taskbar_target_rect(None, bar)
+        self.assertTrue(bar.contains(fallback.center()))
+        self.assertLess(abs(fallback.center().x() - bar.center().x()), 2)
+        self.assertNotEqual(fallback.left(), bar.left())
+        self.assertEqual(taskbar_target_rect(None, None).width(), 0)
         screen = QRect(0, 0, 1920, 1040)
         self.assertEqual(maximize_geometry(screen), screen)
+        normal = QRect(80, 60, 920, 700)
 
         _app()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1937,6 +1941,14 @@ class FramelessWindowTests(unittest.TestCase):
                     for button in header_buttons:
                         self.assertEqual(button.size(), shared)
                         self.assertEqual(button.toolTip(), "")
+                        self.assertEqual(button.text(), "")
+                        self.assertFalse(button.icon().isNull())
+                        self.assertEqual(button.iconSize().width(), 16)
+                        self.assertEqual(button.iconSize().height(), 16)
+                    with patch.object(window, "_open_settings") as open_settings:
+                        window.settings_button.click()
+                    open_settings.assert_called_once()
+                    self.assertEqual(window.settings_button.property("chromeGlyph"), "settings")
 
                     window.move(80, 60)
                     local = QPointF(12, 10)
@@ -1970,20 +1982,23 @@ class FramelessWindowTests(unittest.TestCase):
                     QTest.qWait(MOTION_MS + 80)
                     self.assertTrue(window.isMaximized())
                     self.assertEqual(window.maximize_button.toolTip(), "")
-                    self.assertEqual(window.maximize_button.text(), "❐")
+                    self.assertEqual(window.maximize_button.text(), "")
+                    self.assertEqual(window.maximize_button.property("chromeGlyph"), "restore")
+                    self.assertEqual(window.corner_radius(), 0)
                     window.maximize_button.click()
                     QTest.qWait(MOTION_MS + 80)
                     self.assertFalse(window.isMaximized())
-                    self.assertEqual(window.maximize_button.text(), "□")
-                    self.assertFalse(window.mask().isEmpty())
-                    self.assertFalse(window.mask().contains(window.rect().topLeft()))
-                    self.assertTrue(window.mask().contains(window.rect().center()))
+                    self.assertEqual(window.maximize_button.property("chromeGlyph"), "maximize")
+                    self.assertTrue(window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground))
+                    self.assertTrue(window.mask().isEmpty())
+                    self.assertEqual(window.corner_radius(), 16)
 
                     window.showMaximized()
+                    self.assertEqual(window.corner_radius(), 0)
                     self.assertTrue(window.mask().isEmpty())
                     window.showNormal()
-                    self.assertFalse(window.mask().isEmpty())
-                    self.assertFalse(window.mask().contains(window.rect().topLeft()))
+                    self.assertEqual(window.corner_radius(), 16)
+                    self.assertTrue(window.mask().isEmpty())
 
                     closed: list[object] = []
 

@@ -92,7 +92,11 @@ QWidget {
     font-family: "Segoe UI";
     color: __TEXT__;
 }
-QMainWindow, QDialog, QMessageBox, QWidget#surface {
+QMainWindow, QWidget#surface {
+    background-color: transparent;
+    color: __TEXT__;
+}
+QDialog, QMessageBox {
     background-color: __BACKGROUND__;
     color: __TEXT__;
 }

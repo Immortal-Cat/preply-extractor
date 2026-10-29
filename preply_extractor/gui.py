@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
+from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
+    QParallelAnimationGroup,
     QPoint,
     QPointF,
     QPropertyAnimation,
@@ -23,7 +27,7 @@ from PySide6.QtCore import (
     QThread,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -84,7 +88,7 @@ from preply_extractor.preply_api import (
     fetch_vocabulary,
 )
 from preply_extractor.settings_dialog import SettingsDialog
-from preply_extractor.themes import DEFAULT_THEME, apply_theme
+from preply_extractor.themes import DEFAULT_THEME, THEMES, apply_theme
 from preply_extractor.ui_text import (
     display_word,
     phrase_for_exception,
@@ -100,40 +104,57 @@ PROFILE_DIR = Path(".preply-profile")
 
 
 _HEADER_BUTTON = QSize(36, 32)
-_CORNER_RADIUS = 12.0
+_ICON_PX = 16
+_ICON_STROKE = 1.7
+_CORNER_RADIUS = 16.0
 MOTION_MS = 200
+_TASKBAR_BUTTON_CLASSES = ("MSTaskListWClass", "Taskbar.TaskListButtonAutomationPeer")
 
 
-def _gear_icon(color: str = "#ffffff", size: int = 15) -> QIcon:
-    """White outline gear, the same weight as the window glyphs."""
+def _chrome_icon(kind: str, color: str = "#ffffff", size: int = _ICON_PX) -> QIcon:
+    """One white outline glyph for every header button, at the same stroke weight."""
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     pen = QPen(QColor(color))
-    pen.setWidthF(1.35)
+    pen.setWidthF(_ICON_STROKE)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.translate(size / 2, size / 2)
-    ring = size * 0.22
-    painter.drawEllipse(QPointF(0, 0), ring, ring)
-    painter.drawEllipse(QPointF(0, 0), size * 0.09, size * 0.09)
-    tooth_inner = ring + 1.1
-    tooth_outer = size * 0.46
-    for _tooth in range(8):
-        painter.drawLine(QPointF(0, -tooth_inner), QPointF(0, -tooth_outer))
-        painter.rotate(45)
+    box = QRectF(3.25, 3.25, size - 6.5, size - 6.5)
+    if kind == "minimize":
+        y = size / 2
+        painter.drawLine(QPointF(box.left(), y), QPointF(box.right(), y))
+    elif kind == "maximize":
+        painter.drawRect(box)
+    elif kind == "restore":
+        shift = 2.3
+        painter.drawRect(box.adjusted(shift, 0, 0, -shift))
+        painter.drawRect(box.adjusted(0, shift, -shift, 0))
+    elif kind == "close":
+        painter.drawLine(box.topLeft(), box.bottomRight())
+        painter.drawLine(box.topRight(), box.bottomLeft())
+    else:
+        _paint_gear(painter, size)
     painter.end()
     return QIcon(pixmap)
 
 
-def shrink_geometry(rect: QRect) -> QRect:
-    """A smaller rect toward the bottom of ``rect``, used to start or end a minimize."""
-    width = max(48, rect.width() // 3)
-    height = max(32, rect.height() // 3)
-    return QRect(rect.center().x() - width // 2, rect.bottom() - height, width, height)
+def _paint_gear(painter: QPainter, size: float) -> None:
+    """A ring, a hole, and six short teeth. Reads as a cog at 16px."""
+    painter.save()
+    painter.translate(size / 2, size / 2)
+    ring = size * 0.23
+    painter.drawEllipse(QPointF(0, 0), ring, ring)
+    painter.drawEllipse(QPointF(0, 0), size * 0.085, size * 0.085)
+    inner = ring + 1.0
+    outer = size * 0.44
+    for _tooth in range(6):
+        painter.drawLine(QPointF(0, -inner), QPointF(0, -outer))
+        painter.rotate(60)
+    painter.restore()
 
 
 def maximize_geometry(available: QRect) -> QRect:
@@ -141,11 +162,324 @@ def maximize_geometry(available: QRect) -> QRect:
     return QRect(available)
 
 
-def _rounded_mask(rect, radius: float = _CORNER_RADIUS) -> QRegion:
-    """Pixel mask for a frameless window. Maximized windows do not use it."""
-    path = QPainterPath()
-    path.addRoundedRect(QRectF(rect), radius, radius)
-    return QRegion(path.toFillPolygon().toPolygon())
+def taskbar_target_rect(button: QRect | None, taskbar: QRect | None) -> QRect:
+    """Prefer the taskbar button. Otherwise a small rect at the center of the bar."""
+    if button is not None and button.width() > 0 and button.height() > 0:
+        return QRect(button)
+    if taskbar is None or taskbar.width() <= 0 or taskbar.height() <= 0:
+        return QRect()
+    width = min(48, taskbar.width())
+    height = min(40, taskbar.height())
+    center = taskbar.center()
+    return QRect(center.x() - width // 2, center.y() - height // 2, width, height)
+
+
+def _taskbar_name_matches(name: str, title: str) -> bool:
+    if not name or not title:
+        return False
+    button = name.casefold().strip()
+    wanted = title.casefold().strip()
+    return button == wanted or button.startswith(wanted + " ") or button.startswith(wanted + "-")
+
+
+def _taskbar_name_rank(name: str) -> int:
+    folded = name.casefold()
+    if "running window" in folded:
+        return 0
+    if "pinned" in folded:
+        return 2
+    return 1
+
+
+class _WinRect(ctypes.Structure):
+    _fields_ = [
+        ("left", wintypes.LONG),
+        ("top", wintypes.LONG),
+        ("right", wintypes.LONG),
+        ("bottom", wintypes.LONG),
+    ]
+
+
+class _AppBarData(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uCallbackMessage", wintypes.UINT),
+        ("uEdge", wintypes.UINT),
+        ("rc", _WinRect),
+        ("lParam", wintypes.LPARAM),
+    ]
+
+
+class _Guid(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _Variant(ctypes.Structure):
+    class _Data(ctypes.Union):
+        _fields_ = [
+            ("llVal", ctypes.c_longlong),
+            ("lVal", ctypes.c_long),
+            ("bstrVal", ctypes.c_void_p),
+            ("parray", ctypes.c_void_p),
+        ]
+
+    _anonymous_ = ("data",)
+    _fields_ = [
+        ("vt", wintypes.USHORT),
+        ("wReserved1", wintypes.USHORT),
+        ("wReserved2", wintypes.USHORT),
+        ("wReserved3", wintypes.USHORT),
+        ("data", _Data),
+    ]
+
+
+def _com_call(obj, index, restype, argtypes, *args):
+    table = ctypes.cast(ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+    function = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(table[index])
+    return function(obj, *args)
+
+
+def _com_release(obj) -> None:
+    if obj is None or not getattr(obj, "value", None):
+        return
+    _com_call(obj, 2, ctypes.c_ulong, [])
+
+
+def taskbar_bar_rect(pixel_ratio: float = 1.0) -> QRect | None:
+    """Primary taskbar from SHAppBarMessage(ABM_GETTASKBARPOS), in Qt logical pixels."""
+    if sys.platform != "win32":
+        return None
+    try:
+        data = _AppBarData()
+        data.cbSize = ctypes.sizeof(_AppBarData)
+        shell32 = ctypes.windll.shell32
+        shell32.SHAppBarMessage.argtypes = [wintypes.DWORD, ctypes.POINTER(_AppBarData)]
+        shell32.SHAppBarMessage.restype = ctypes.c_void_p
+        if not shell32.SHAppBarMessage(5, ctypes.byref(data)):
+            return None
+        rect = data.rc
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            return None
+        ratio = pixel_ratio if pixel_ratio > 0 else 1.0
+        return QRect(
+            round(rect.left / ratio),
+            round(rect.top / ratio),
+            round(width / ratio),
+            round(height / ratio),
+        )
+    except Exception:
+        return None
+
+
+def find_taskbar_button_rect(hwnd: int, title: str) -> QRect | None:
+    """Taskbar button for this window, via UI Automation on Shell_TrayWnd.
+
+    Windows 10 keeps the buttons in ``MSTaskListWClass``. Windows 11 exposes the
+    same row as ``Taskbar.TaskListButtonAutomationPeer`` (the native handle on
+    those peers is usually 0, so the window title is the match). The rectangle
+    is already in the logical pixels Qt uses. ``None`` if it cannot be found.
+    """
+    if sys.platform != "win32" or (not hwnd and not title):
+        return None
+    try:
+        return _uia_taskbar_button(int(hwnd or 0), title or "")
+    except Exception:
+        return None
+
+
+def _uia_taskbar_button(hwnd: int, title: str) -> QRect | None:
+    ole32 = ctypes.windll.ole32
+    user32 = ctypes.windll.user32
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    started = ole32.CoInitializeEx(None, 2)
+    balance = started in (0, 1)
+    automation = ctypes.c_void_p()
+    try:
+        if started not in (0, 1):
+            return None
+        clsid = _Guid.from_buffer_copy(uuid.UUID("ff48dba4-60ef-4201-aa87-54103eef594e").bytes_le)
+        iid = _Guid.from_buffer_copy(uuid.UUID("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee").bytes_le)
+        created = ole32.CoCreateInstance(
+            ctypes.byref(clsid),
+            None,
+            1,
+            ctypes.byref(iid),
+            ctypes.byref(automation),
+        )
+        if created != 0 or not automation.value:
+            return None
+        user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_wchar_p, ctypes.c_wchar_p]
+        user32.FindWindowExW.restype = wintypes.HWND
+        trays = []
+        main = user32.FindWindowW("Shell_TrayWnd", None)
+        if main:
+            trays.append(main)
+        previous = None
+        while True:
+            extra = user32.FindWindowExW(None, previous, "Shell_SecondaryTrayWnd", None)
+            if not extra:
+                break
+            trays.append(extra)
+            previous = extra
+        matches: list[tuple[int, QRect]] = []
+        for tray in trays:
+            element = _uia_element_from_handle(automation, tray)
+            if not element or not element.value:
+                continue
+            try:
+                for class_name in _TASKBAR_BUTTON_CLASSES:
+                    found = _uia_buttons(automation, element, class_name)
+                    matches.extend(_uia_matching_buttons(found, hwnd, title))
+                    if matches:
+                        break
+            finally:
+                _com_release(element)
+            if matches:
+                break
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item[0])
+        return QRect(matches[0][1])
+    finally:
+        _com_release(automation)
+        if balance:
+            ole32.CoUninitialize()
+
+
+def _bstr_variant(text: str) -> _Variant:
+    oleaut32 = ctypes.windll.oleaut32
+    oleaut32.SysAllocString.argtypes = [ctypes.c_wchar_p]
+    oleaut32.SysAllocString.restype = ctypes.c_void_p
+    value = _Variant()
+    value.vt = 8
+    value.bstrVal = oleaut32.SysAllocString(text)
+    return value
+
+
+def _clear_variant(value: _Variant) -> None:
+    oleaut32 = ctypes.windll.oleaut32
+    oleaut32.VariantClear.argtypes = [ctypes.POINTER(_Variant)]
+    oleaut32.VariantClear(ctypes.byref(value))
+
+
+def _uia_element_from_handle(automation, hwnd):
+    element = ctypes.c_void_p()
+    result = _com_call(
+        automation,
+        6,
+        ctypes.c_long,
+        [wintypes.HWND, ctypes.POINTER(ctypes.c_void_p)],
+        hwnd,
+        ctypes.byref(element),
+    )
+    if result != 0:
+        return None
+    return element
+
+
+def _uia_buttons(automation, root, class_name: str) -> list:
+    variant = _bstr_variant(class_name)
+    condition = ctypes.c_void_p()
+    buttons: list = []
+    try:
+        result = _com_call(
+            automation,
+            23,
+            ctypes.c_long,
+            [ctypes.c_int, _Variant, ctypes.POINTER(ctypes.c_void_p)],
+            30012,
+            variant,
+            ctypes.byref(condition),
+        )
+        if result != 0 or not condition.value:
+            return []
+        array = ctypes.c_void_p()
+        result = _com_call(
+            root,
+            6,
+            ctypes.c_long,
+            [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+            4,
+            condition,
+            ctypes.byref(array),
+        )
+        if result != 0 or not array.value:
+            return []
+        try:
+            length = ctypes.c_int()
+            _com_call(array, 3, ctypes.c_long, [ctypes.POINTER(ctypes.c_int)], ctypes.byref(length))
+            for index in range(length.value):
+                item = ctypes.c_void_p()
+                got = _com_call(
+                    array,
+                    4,
+                    ctypes.c_long,
+                    [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)],
+                    index,
+                    ctypes.byref(item),
+                )
+                if got == 0 and item.value:
+                    buttons.append(item)
+        finally:
+            _com_release(array)
+        return buttons
+    finally:
+        _com_release(condition)
+        _clear_variant(variant)
+
+
+def _uia_text(element, index: int) -> str:
+    value = ctypes.c_void_p()
+    result = _com_call(element, index, ctypes.c_long, [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(value))
+    if result != 0 or not value.value:
+        return ""
+    text = ctypes.wstring_at(value)
+    ctypes.windll.oleaut32.SysFreeString(value)
+    return text
+
+
+def _uia_bounds(element) -> QRect:
+    rect = _WinRect()
+    result = _com_call(element, 43, ctypes.c_long, [ctypes.POINTER(_WinRect)], ctypes.byref(rect))
+    if result != 0:
+        return QRect()
+    return QRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+
+def _uia_native_hwnd(element) -> int:
+    handle = ctypes.c_void_p()
+    result = _com_call(element, 36, ctypes.c_long, [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(handle))
+    if result != 0 or not handle.value:
+        return 0
+    return int(handle.value)
+
+
+def _uia_matching_buttons(buttons: list, hwnd: int, title: str) -> list[tuple[int, QRect]]:
+    matches: list[tuple[int, QRect]] = []
+    try:
+        for item in buttons:
+            name = _uia_text(item, 23)
+            native = _uia_native_hwnd(item)
+            bounds = _uia_bounds(item)
+            if bounds.width() <= 0 or bounds.height() <= 0 or bounds.height() > 120:
+                continue
+            if (hwnd and native == hwnd) or _taskbar_name_matches(name, title):
+                matches.append((_taskbar_name_rank(name), bounds))
+    finally:
+        for item in buttons:
+            _com_release(item)
+    return matches
 
 
 def program_profile_directory() -> Path:
@@ -1169,13 +1503,57 @@ class SavePanel(QWidget):
         self._write_copy(destination)
 
 
+class _MotionSnapshot(QWidget):
+    """A still picture of the window, so maximize does not reflow the live layout."""
+
+    def __init__(self, pixmap: QPixmap) -> None:
+        flags = (
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self._pixmap = pixmap
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(self.rect(), self._pixmap)
+
+
+class _WindowFrame(QWidget):
+    """Paints an antialiased rounded fill. Maximized, the fill is square and flush."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("surface")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        window = self.window()
+        maximized = window.isMaximized() or window.isFullScreen()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(THEMES[DEFAULT_THEME].background))
+        if maximized:
+            painter.drawRect(self.rect())
+            return
+        painter.drawRoundedRect(QRectF(self.rect()), _CORNER_RADIUS, _CORNER_RADIUS)
+
+
 class WindowMotion:
     """Animates minimize, restore, and maximize. Close stays immediate."""
 
     def __init__(self, window: QMainWindow) -> None:
         self._window = window
         self._normal: QRect | None = None
-        self._animation: QPropertyAnimation | None = None
+        self._animation: QParallelAnimationGroup | None = None
+        self._snapshot: _MotionSnapshot | None = None
         self._dragging = False
         self.mode: str | None = None
 
@@ -1192,6 +1570,9 @@ class WindowMotion:
             animation.blockSignals(True)
             animation.stop()
             animation.deleteLater()
+        self._drop_snapshot()
+        if self._window.windowOpacity() != 1.0:
+            self._window.setWindowOpacity(1.0)
 
     def remember_normal(self) -> None:
         window = self._window
@@ -1208,6 +1589,16 @@ class WindowMotion:
         if self.mode is None and not self._window.isMaximized() and not self._window.isMinimized():
             self._normal = QRect(self._window.geometry())
 
+    def _dock_rect(self) -> QRect:
+        button = find_taskbar_button_rect(int(self._window.winId()), self._window.windowTitle())
+        screen = self._window.screen()
+        ratio = float(screen.devicePixelRatio()) if screen is not None and screen.devicePixelRatio() else 1.0
+        target = taskbar_target_rect(button, taskbar_bar_rect(ratio))
+        if target.width() > 0 and target.height() > 0:
+            return target
+        available = screen.availableGeometry() if screen is not None else QRect(self._window.geometry())
+        return QRect(available.center().x() - 24, available.bottom() - 40, 48, 40)
+
     def minimize(self) -> None:
         if self._dragging:
             self._capture_if_idle()
@@ -1217,7 +1608,8 @@ class WindowMotion:
         self.stop()
         start = QRect(self._window.geometry())
         self.mode = "minimize"
-        self._animate(start, shrink_geometry(start), self._after_minimize)
+        self._window.setWindowOpacity(1.0)
+        self._animate(self._window, start, self._dock_rect(), self._after_minimize, opacity_end=0.35)
 
     def _after_minimize(self) -> None:
         if self.mode != "minimize":
@@ -1225,29 +1617,49 @@ class WindowMotion:
         self.mode = None
         self._animation = None
         self._window.showMinimized()
+        self._window.setWindowOpacity(1.0)
 
     def restore_minimized(self) -> None:
+        was_minimizing = self.mode == "minimize"
         self.stop()
+        if was_minimizing and not self._window.isMinimized():
+            self._window.setGeometry(self.normal_rect())
+            self._window.setWindowOpacity(1.0)
+            self._window._sync_corners()
+            return
         target = self.normal_rect()
+        origin = self._dock_rect()
+        self._window.setWindowOpacity(0.0)
         self._window.showNormal()
-        start = shrink_geometry(target)
-        self._window.setGeometry(start)
-        self._window._apply_corner_mask()
+        self._window.setGeometry(origin)
+        self._window._sync_corners()
+        self._window.setWindowOpacity(0.15)
         self.mode = "restore-min"
-        self._animate(start, target, self._after_geometry)
+        self._animate(self._window, origin, target, self._after_restore_min, opacity_end=1.0)
+
+    def _after_restore_min(self) -> None:
+        if self.mode != "restore-min":
+            return
+        self.mode = None
+        self._animation = None
+        self._window.setWindowOpacity(1.0)
+        self._window._sync_corners()
 
     def maximize(self) -> None:
         if self._dragging:
             self._capture_if_idle()
             self._window.showMaximized()
-            self._window._apply_corner_mask()
+            self._window._sync_corners()
             return
         self._capture_if_idle()
         self.stop()
         screen = self._window.screen()
         available = screen.availableGeometry() if screen is not None else QRect(self._window.geometry())
+        start = QRect(self._window.geometry())
+        self._show_snapshot(start)
+        self._window.setWindowOpacity(0.0)
         self.mode = "maximize"
-        self._animate(QRect(self._window.geometry()), maximize_geometry(available), self._after_maximize)
+        self._animate(self._snapshot, start, maximize_geometry(available), self._after_maximize)
 
     def _after_maximize(self) -> None:
         if self.mode != "maximize":
@@ -1255,32 +1667,69 @@ class WindowMotion:
         self.mode = None
         self._animation = None
         self._window.showMaximized()
-        self._window._apply_corner_mask()
+        self._window.setWindowOpacity(1.0)
+        self._window._sync_corners()
+        self._drop_snapshot()
 
     def restore_maximized(self) -> None:
         self.stop()
+        if not self._window.isMaximized():
+            self._window.setWindowOpacity(1.0)
+            self._window._sync_corners()
+            return
         target = self.normal_rect()
-        current = QRect(self._window.geometry())
+        start = QRect(self._window.geometry())
+        self._show_snapshot(start)
+        self._window.setWindowOpacity(0.0)
         self._window.showNormal()
-        self._window.setGeometry(current)
-        self._window._apply_corner_mask()
         self.mode = "restore-max"
-        self._animate(current, target, self._after_geometry)
+        self._animate(self._snapshot, start, target, self._after_restore_max)
 
-    def _after_geometry(self) -> None:
+    def _after_restore_max(self) -> None:
+        if self.mode != "restore-max":
+            return
         self.mode = None
         self._animation = None
-        self._window._apply_corner_mask()
+        self._window.setGeometry(self.normal_rect())
+        self._window.setWindowOpacity(1.0)
+        self._window._sync_corners()
+        self._drop_snapshot()
 
-    def _animate(self, start: QRect, end: QRect, on_done) -> None:
-        animation = QPropertyAnimation(self._window, b"geometry", self._window)
-        animation.setDuration(MOTION_MS)
-        animation.setStartValue(start)
-        animation.setEndValue(end)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.finished.connect(on_done)
-        self._animation = animation
-        animation.start()
+    def _show_snapshot(self, rect: QRect) -> None:
+        self._drop_snapshot()
+        snapshot = _MotionSnapshot(self._window.grab())
+        snapshot.setGeometry(rect)
+        snapshot.show()
+        self._snapshot = snapshot
+
+    def _drop_snapshot(self) -> None:
+        snapshot = self._snapshot
+        self._snapshot = None
+        if snapshot is not None:
+            snapshot.hide()
+            snapshot.deleteLater()
+
+    def _animate(self, target, start: QRect, end: QRect, on_done, opacity_end: float | None = None) -> None:
+        if target is None:
+            on_done()
+            return
+        group = QParallelAnimationGroup(self._window)
+        geometry = QPropertyAnimation(target, b"geometry", group)
+        geometry.setDuration(MOTION_MS)
+        geometry.setStartValue(start)
+        geometry.setEndValue(end)
+        geometry.setEasingCurve(QEasingCurve.Type.OutCubic)
+        group.addAnimation(geometry)
+        if opacity_end is not None:
+            fade = QPropertyAnimation(target, b"windowOpacity", group)
+            fade.setDuration(MOTION_MS)
+            fade.setStartValue(float(target.windowOpacity()))
+            fade.setEndValue(opacity_end)
+            fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+            group.addAnimation(fade)
+        group.finished.connect(on_done)
+        self._animation = group
+        group.start()
 
 
 class _TitleBar(QWidget):
@@ -1331,6 +1780,8 @@ class MainWindow(QMainWindow):
         self._profile_user_id: str | None = None
         self._profile_display_name: str | None = None
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setWindowTitle(tr("window_title"))
         self.resize(920, 700)
         self.setMinimumSize(760, 560)
@@ -1340,8 +1791,7 @@ class MainWindow(QMainWindow):
         self._selected_alias = ""
         self._chooser_needed = False
 
-        root = QWidget()
-        root.setObjectName("surface")
+        root = _WindowFrame()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -1357,17 +1807,14 @@ class MainWindow(QMainWindow):
         self.heading.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.settings_button = QPushButton()
         self.settings_button.setObjectName("settingsButton")
-        self.settings_button.setText("")
-        self.settings_button.setIcon(_gear_icon())
-        self.settings_button.setIconSize(QSize(15, 15))
         self.settings_button.setFixedSize(_HEADER_BUTTON)
-        self.settings_button.setToolTip("")
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._set_chrome_icon(self.settings_button, "settings")
         self.settings_button.clicked.connect(self._open_settings)
-        self.minimize_button = self._chrome_button("windowButton", "–")
-        self.maximize_button = self._chrome_button("windowButton", "□")
-        self.close_button = self._chrome_button("closeButton", "✕")
+        self.minimize_button = self._chrome_button("windowButton", "minimize")
+        self.maximize_button = self._chrome_button("windowButton", "maximize")
+        self.close_button = self._chrome_button("closeButton", "close")
         self.minimize_button.clicked.connect(self._motion.minimize)
         self.maximize_button.clicked.connect(self._toggle_maximized)
         self.close_button.clicked.connect(self.close)
@@ -1806,12 +2253,9 @@ class MainWindow(QMainWindow):
         current = self.stack.currentIndex()
         self.setWindowTitle(tr("window_title"))
         self.heading.setText(tr("window_title"))
-        self.settings_button.setText("")
-        self.settings_button.setToolTip("")
-        self.settings_button.setIcon(_gear_icon())
-        self.minimize_button.setToolTip("")
-        self.maximize_button.setToolTip("")
-        self.close_button.setToolTip("")
+        self._set_chrome_icon(self.settings_button, "settings")
+        self._set_chrome_icon(self.minimize_button, "minimize")
+        self._set_chrome_icon(self.close_button, "close")
         self._sync_maximize_button()
         self._rebuild_steps()
         self.deps_panel.retranslate()
@@ -1826,14 +2270,21 @@ class MainWindow(QMainWindow):
         self._set_connection(self._status_state, phrase_text(self._status_phrase))
         self._show_step(current)
 
-    def _chrome_button(self, object_name: str, glyph: str) -> QPushButton:
-        button = QPushButton(glyph)
-        button.setObjectName(object_name)
+    def _set_chrome_icon(self, button: QPushButton, kind: str) -> None:
+        button.setText("")
         button.setToolTip("")
+        button.setIcon(_chrome_icon(kind))
+        button.setIconSize(QSize(_ICON_PX, _ICON_PX))
+        button.setProperty("chromeGlyph", kind)
+
+    def _chrome_button(self, object_name: str, kind: str) -> QPushButton:
+        button = QPushButton()
+        button.setObjectName(object_name)
         button.setFixedSize(_HEADER_BUTTON)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setAutoDefault(False)
+        self._set_chrome_icon(button, kind)
         return button
 
     def _toggle_maximized(self) -> None:
@@ -1847,32 +2298,35 @@ class MainWindow(QMainWindow):
         self._motion.maximize()
 
     def _sync_maximize_button(self) -> None:
-        if self.isMaximized():
-            self.maximize_button.setText("❐")
-        else:
-            self.maximize_button.setText("□")
-        self.maximize_button.setToolTip("")
+        kind = "restore" if self.isMaximized() else "maximize"
+        self._set_chrome_icon(self.maximize_button, kind)
 
-    def _apply_corner_mask(self) -> None:
-        """Round the frame while windowed. A maximized window stays square."""
-        if self.isMaximized() or self.isFullScreen() or self.width() < 1 or self.height() < 1:
-            self.clearMask()
-            return
-        self.setMask(_rounded_mask(self.rect(), _CORNER_RADIUS))
+    def corner_radius(self) -> float:
+        if self.isMaximized() or self.isFullScreen():
+            return 0.0
+        return _CORNER_RADIUS
+
+    def _sync_corners(self) -> None:
+        """Drop any 1-bit mask and repaint the antialiased frame."""
+        self.clearMask()
+        frame = self.centralWidget()
+        if frame is not None:
+            frame.update()
+        self.update()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
-        self._apply_corner_mask()
+        self._sync_corners()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._apply_corner_mask()
+        self._sync_corners()
 
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "maximize_button"):
             self._sync_maximize_button()
-            self._apply_corner_mask()
+            self._sync_corners()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._motion.stop()
